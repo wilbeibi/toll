@@ -26,5 +26,4 @@ mod tests {
             Some("claude-3-5-sonnet".to_string())
         );
     }
-
 }

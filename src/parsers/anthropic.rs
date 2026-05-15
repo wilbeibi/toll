@@ -87,5 +87,4 @@ mod tests {
         assert_eq!(u.output_tokens, Some(50));
         assert_eq!(u.cache_read_input_tokens, Some(20)); // preserved
     }
-
 }
