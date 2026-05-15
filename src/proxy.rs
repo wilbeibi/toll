@@ -595,6 +595,25 @@ fn maybe_inject_stream_options(body: Bytes) -> Bytes {
     serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
 }
 
+/// Spawn a proxy on a caller-supplied listener (for tests).
+#[allow(dead_code)]
+pub async fn serve_on(
+    listener: TcpListener,
+    provider: &'static Provider,
+    store: Arc<Mutex<Store>>,
+) -> tokio::task::JoinHandle<()> {
+    let client = Client::builder().use_rustls_tls().build().unwrap();
+    let state = Arc::new(ProxyState {
+        provider,
+        client,
+        store,
+    });
+    let app = Router::new().fallback(handle_request).with_state(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,23 +663,4 @@ mod tests {
         let out = maybe_inject_stream_options(garbage.clone());
         assert_eq!(out, garbage);
     }
-}
-
-/// Spawn a proxy on a caller-supplied listener (for tests).
-#[allow(dead_code)]
-pub async fn serve_on(
-    listener: TcpListener,
-    provider: &'static Provider,
-    store: Arc<Mutex<Store>>,
-) -> tokio::task::JoinHandle<()> {
-    let client = Client::builder().use_rustls_tls().build().unwrap();
-    let state = Arc::new(ProxyState {
-        provider,
-        client,
-        store,
-    });
-    let app = Router::new().fallback(handle_request).with_state(state);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    })
 }

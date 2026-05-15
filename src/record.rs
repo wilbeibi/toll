@@ -128,9 +128,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_model    ON calls(model);",
         )?;
         // Forward-compatible: ignore duplicate column errors on existing DBs.
-        for sql in &[
-            "ALTER TABLE calls ADD COLUMN reasoning_output_tokens INTEGER",
-        ] {
+        for sql in &["ALTER TABLE calls ADD COLUMN reasoning_output_tokens INTEGER"] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 if !e.to_string().contains("duplicate column name") {
                     return Err(e.into());
@@ -252,16 +250,12 @@ impl Store {
                         input_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
                         output_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
                         total_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                        cache_read_input_tokens: row
-                            .get::<_, Option<i64>>(13)?
-                            .map(|v| v as u64),
+                        cache_read_input_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                         cache_creation_input_tokens: row
                             .get::<_, Option<i64>>(14)?
                             .map(|v| v as u64),
                         cache_hit: row.get::<_, Option<i64>>(15)?.map(|v| v != 0),
-                        reasoning_output_tokens: row
-                            .get::<_, Option<i64>>(16)?
-                            .map(|v| v as u64),
+                        reasoning_output_tokens: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
                         request_id: row.get(17)?,
                         error_kind: row.get(18)?,
                         error_message: row.get(19)?,
