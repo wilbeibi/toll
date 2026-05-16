@@ -52,6 +52,8 @@ pub fn parse_openai(body: &Value) -> Usage {
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: None,
         reasoning_output_tokens: reasoning,
+        // OpenRouter reports the exact billed cost (USD) in `usage.cost`.
+        cost: u.get("cost").and_then(|v| v.as_f64()),
     }
 }
 
@@ -114,6 +116,22 @@ mod tests {
             }
         }));
         assert_eq!(u.cache_read_input_tokens, Some(25));
+    }
+
+    #[test]
+    fn parse_openrouter_cost() {
+        let u = parse_openai(&json!({
+            "usage": { "prompt_tokens": 17, "completion_tokens": 175, "cost": 0.000346775 }
+        }));
+        assert_eq!(u.cost, Some(0.000346775));
+    }
+
+    #[test]
+    fn parse_cost_absent_is_none() {
+        let u = parse_openai(&json!({
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        }));
+        assert_eq!(u.cost, None);
     }
 
     #[test]

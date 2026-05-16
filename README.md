@@ -93,6 +93,8 @@ Code map:
 
 The `Record` schema is a compatibility contract. New fields must be optional, forward-migrated, and covered by tests.
 
+See [`DESIGN.md`](DESIGN.md) for the philosophy, architecture, and invariants behind toll — read it before non-trivial changes.
+
 ## Status
 
 `0.1.0`. Single Rust binary; no runtime dependencies beyond the system.

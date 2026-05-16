@@ -20,28 +20,12 @@ pub struct Provider {
     pub merge_sse: MergeSse,
     /// If Some, model is extracted from the request path instead of body.
     pub model_from_path: Option<fn(&str) -> Option<String>>,
-    /// For routers that carry `vendor/model` slugs, extract the underlying model.
-    pub route_model: fn(Option<String>) -> Option<String>,
     /// Shell export template. `{port}` is substituted at print time.
     pub env_template: Option<&'static str>,
     /// Inject `stream_options: {include_usage: true}` into streaming requests so
     /// the final SSE chunk carries token counts. True for OpenAI-compatible APIs;
     /// false for Anthropic (reports via message_start/delta) and Gemini.
     pub inject_stream_options: bool,
-}
-
-fn identity(m: Option<String>) -> Option<String> {
-    m
-}
-
-fn slash_suffix(m: Option<String>) -> Option<String> {
-    m.and_then(|s| {
-        if s.contains('/') {
-            s.split_once('/').map(|x| x.1.to_string())
-        } else {
-            Some(s)
-        }
-    })
 }
 
 pub fn gemini_model_from_path(path: &str) -> Option<String> {
@@ -65,7 +49,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_anthropic_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}"),
         inject_stream_options: false,
     },
@@ -78,7 +61,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
     },
@@ -91,7 +73,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
     },
@@ -104,7 +85,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: slash_suffix,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/api/v1"),
         inject_stream_options: true,
     },
@@ -117,7 +97,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usageMetadata",
         merge_sse: merge_gemini_sse,
         model_from_path: Some(gemini_model_from_path),
-        route_model: identity,
         env_template: None,
         inject_stream_options: false,
     },
@@ -130,7 +109,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
     },
@@ -143,7 +121,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
     },
@@ -156,7 +133,6 @@ pub static PROVIDERS: &[Provider] = &[
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
         model_from_path: None,
-        route_model: identity,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/api/paas/v4"),
         inject_stream_options: true,
     },
@@ -210,15 +186,6 @@ mod tests {
         assert_eq!(
             find_by_host("api.openai.com:443").map(|p| p.name),
             Some("openai")
-        );
-    }
-
-    #[test]
-    fn slash_suffix_strips_vendor_prefix() {
-        // OpenRouter uses "vendor/model" slugs; we want only the model part
-        assert_eq!(
-            slash_suffix(Some("anthropic/claude-3-opus".to_string())),
-            Some("claude-3-opus".to_string())
         );
     }
 }

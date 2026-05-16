@@ -1,5 +1,5 @@
 use crate::json_usage::JsonUsageExtractor;
-use crate::parsers::model_from_request_body;
+use crate::parsers::{model_from_request_body, model_from_response_value};
 use crate::paths::calls_db;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
 use crate::record::{classify_error, Record, Store, Usage};
@@ -110,6 +110,10 @@ pub async fn run_all() -> Result<()> {
     for h in handles {
         let _ = h.await;
     }
+
+    // All servers have stopped; fold the WAL back and refresh stats so the
+    // DB is compact and query-ready at rest.
+    store.lock().unwrap_or_else(|e| e.into_inner()).checkpoint();
     Ok(())
 }
 
@@ -130,10 +134,7 @@ async fn handle_request(
     let headers = parts.headers;
 
     // Model from path (Gemini) or from body.
-    let model_from_path = provider
-        .model_from_path
-        .and_then(|f| f(path))
-        .map(|m| (provider.route_model)(Some(m.clone())).unwrap_or(m));
+    let model_from_path = provider.model_from_path.and_then(|f| f(path));
 
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
@@ -156,8 +157,7 @@ async fn handle_request(
         (None, ReqwestBody::wrap_stream(body.into_data_stream()))
     };
 
-    let model = model_from_path
-        .or_else(|| model_from_body.map(|m| (provider.route_model)(Some(m.clone())).unwrap_or(m)));
+    let model = model_from_path.or(model_from_body);
 
     // Build upstream URL.
     let upstream = format!("{}{}", provider.upstream_url, uri);
@@ -208,6 +208,7 @@ async fn handle_request(
                 request_id: None,
                 error_kind: Some(kind.to_string()),
                 error_message: Some(e.to_string()),
+                cost: None,
             };
             spawn_record_write(state.store.clone(), rec);
             return Err(StatusCode::BAD_GATEWAY);
@@ -344,7 +345,7 @@ fn new_call_id() -> String {
 
 fn spawn_observer(
     kind: ObserverKind,
-    base: RecordBase,
+    mut base: RecordBase,
     store: Arc<Mutex<Store>>,
     dropped: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<ObserveMsg>,
@@ -376,6 +377,13 @@ fn spawn_observer(
                                 }
                                 if let Ok(data) = serde_json::from_str::<Value>(&event.data) {
                                     if data.is_object() {
+                                        // Backfill model when the request body
+                                        // was too large to inspect; streaming
+                                        // responses echo it on the chunk that
+                                        // also carries usage / message_start.
+                                        if base.model.is_none() {
+                                            base.model = model_from_response_value(&data);
+                                        }
                                         merge(&event.event_type, &data, &mut usage);
                                     }
                                 }
@@ -489,10 +497,35 @@ fn record_from_base(
         request_id: base.request_id.clone(),
         error_kind,
         error_message,
+        cost: usage.cost,
     }
 }
 
+/// toll records *inference* — requests that consume tokens and cost money.
+/// The OpenAI-compatible inference surface (plus Anthropic / Gemini) is
+/// small and stable; the junk clients probe (`/api/tags`, `/version`,
+/// `/props`, model listings, ...) is open-ended. So we allowlist inference
+/// rather than chase an ever-growing denylist of probes. Calls are still
+/// proxied normally — this only governs whether we log them.
+///
+/// Bias toward inclusion: anything that can carry a `usage` object must
+/// match, or we silently lose cost data.
+fn is_inference_endpoint(endpoint: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "/completions", // /v1/completions and /v1/chat/completions
+        "/embeddings",
+        "/messages",       // Anthropic
+        "/responses",      // OpenAI Responses API
+        "generatecontent", // Gemini :generateContent / :streamGenerateContent
+    ];
+    let e = endpoint.to_ascii_lowercase();
+    MARKERS.iter().any(|m| e.contains(m))
+}
+
 fn spawn_record_write(store: Arc<Mutex<Store>>, record: Record) {
+    if !is_inference_endpoint(&record.endpoint) {
+        return;
+    }
     let handle = tokio::task::spawn_blocking(move || {
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = s.insert(&record) {
@@ -662,5 +695,37 @@ mod tests {
         let garbage = Bytes::from_static(b"not json");
         let out = maybe_inject_stream_options(garbage.clone());
         assert_eq!(out, garbage);
+    }
+
+    #[test]
+    fn inference_endpoints_are_recorded() {
+        for e in [
+            "/v1/chat/completions",
+            "/api/v1/chat/completions", // OpenRouter
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/messages",                              // Anthropic
+            "/v1/responses",                             // OpenAI Responses
+            "/v1beta/models/gemini-2.0:generateContent", // Gemini
+            "/v1beta/models/gemini-2.0:streamGenerateContent",
+        ] {
+            assert!(is_inference_endpoint(e), "{e} should be recorded");
+        }
+    }
+
+    #[test]
+    fn probes_and_listings_are_skipped() {
+        for e in [
+            "/api/tags",
+            "/api/show",
+            "/api/v1/models",
+            "/props",
+            "/v1/props",
+            "/version",
+            "/v1/models",
+            "/v1/models/deepseek-v4-pro",
+        ] {
+            assert!(!is_inference_endpoint(e), "{e} should be skipped");
+        }
     }
 }
