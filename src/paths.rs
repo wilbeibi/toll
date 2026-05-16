@@ -13,6 +13,10 @@ pub fn calls_db() -> PathBuf {
     data_dir().join("calls.db")
 }
 
+pub fn prices_json() -> PathBuf {
+    data_dir().join("prices.json")
+}
+
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)

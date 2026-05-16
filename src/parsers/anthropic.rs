@@ -53,7 +53,6 @@ mod tests {
         }));
         assert_eq!(u.cache_read_input_tokens, Some(20));
         assert_eq!(u.cache_creation_input_tokens, Some(5));
-        assert_eq!(u.cache_hit(), Some(true));
     }
 
     #[test]

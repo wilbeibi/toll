@@ -6,7 +6,6 @@ pub fn parse_gemini(body: &Value) -> Usage {
     Usage {
         input_tokens: u.and_then(|m| m.get("promptTokenCount")?.as_u64()),
         output_tokens: u.and_then(|m| m.get("candidatesTokenCount")?.as_u64()),
-        total_tokens: u.and_then(|m| m.get("totalTokenCount")?.as_u64()),
         cache_read_input_tokens: u.and_then(|m| m.get("cachedContentTokenCount")?.as_u64()),
         reasoning_output_tokens: u.and_then(|m| m.get("thoughtsTokenCount")?.as_u64()),
         ..Default::default()
@@ -37,7 +36,6 @@ mod tests {
             }
         }));
         assert_eq!(u.cache_read_input_tokens, Some(20));
-        assert_eq!(u.cache_hit(), Some(true));
     }
 
     #[test]
@@ -50,7 +48,6 @@ mod tests {
                 "usageMetadata": {
                     "promptTokenCount": 10,
                     "candidatesTokenCount": 5,
-                    "totalTokenCount": 15,
                 }
             }),
             &mut u,

@@ -35,6 +35,20 @@ pub enum Command {
         #[arg(long, value_enum, default_value = "shell")]
         format: Format,
     },
+
+    /// Manage the local pricing table.
+    Prices {
+        #[command(subcommand)]
+        cmd: PricesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PricesCmd {
+    /// Fetch latest prices from litellm and save to the local data directory.
+    Pull,
+    /// Show which price table is active and how many models it covers.
+    Show,
 }
 
 #[derive(ValueEnum, Clone)]
