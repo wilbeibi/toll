@@ -17,6 +17,12 @@ pub struct Usage {
     pub cost: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotalTokenSemantics {
+    CacheIncludedInInput,
+    CacheAdditiveToInput,
+}
+
 impl Usage {
     pub fn merge(&mut self, other: &Usage) {
         macro_rules! take {
@@ -39,19 +45,22 @@ impl Usage {
         self.cache_read_input_tokens.map(|n| n > 0)
     }
 
-    pub fn total(&self) -> Option<u64> {
+    pub fn total(&self, semantics: TotalTokenSemantics) -> Option<u64> {
         if let Some(t) = self.total_tokens {
             return Some(t);
         }
-        if self.input_tokens.is_none() && self.output_tokens.is_none() {
-            return None;
+        let has_base = self.input_tokens.is_some() || self.output_tokens.is_some();
+        let has_cache =
+            self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some();
+        let total = self.input_tokens.unwrap_or(0) + self.output_tokens.unwrap_or(0);
+        match semantics {
+            TotalTokenSemantics::CacheIncludedInInput => has_base.then_some(total),
+            TotalTokenSemantics::CacheAdditiveToInput => (has_base || has_cache).then_some(
+                total
+                    + self.cache_read_input_tokens.unwrap_or(0)
+                    + self.cache_creation_input_tokens.unwrap_or(0),
+            ),
         }
-        Some(
-            self.input_tokens.unwrap_or(0)
-                + self.output_tokens.unwrap_or(0)
-                + self.cache_read_input_tokens.unwrap_or(0)
-                + self.cache_creation_input_tokens.unwrap_or(0),
-        )
     }
 }
 
@@ -354,14 +363,35 @@ mod tests {
     }
 
     #[test]
-    fn usage_total_derived() {
+    fn usage_total_cache_included_in_input() {
         let u = Usage {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cache_read_input_tokens: Some(3),
             ..Default::default()
         };
-        assert_eq!(u.total(), Some(18));
+        assert_eq!(u.total(TotalTokenSemantics::CacheIncludedInInput), Some(15));
+    }
+
+    #[test]
+    fn usage_total_cache_additive_to_input() {
+        let u = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_input_tokens: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(u.total(TotalTokenSemantics::CacheAdditiveToInput), Some(18));
+    }
+
+    #[test]
+    fn usage_total_cache_only_is_unknown_when_cache_is_included() {
+        let u = Usage {
+            cache_read_input_tokens: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(u.total(TotalTokenSemantics::CacheIncludedInInput), None);
+        assert_eq!(u.total(TotalTokenSemantics::CacheAdditiveToInput), Some(3));
     }
 
     fn sample_record(id: &str) -> Record {

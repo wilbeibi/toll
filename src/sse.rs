@@ -1,37 +1,53 @@
-/// SSE frame splitter. Takes a mutable buffer and a new chunk, parses out
-/// complete events (terminated by \n\n), and returns them. Incomplete tail
-/// bytes stay in the buffer.
-pub fn split_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<SseEvent> {
-    buf.extend_from_slice(chunk);
+/// Bounded SSE frame splitter. It keeps only the incomplete current event.
+pub struct SseSplitter {
+    buf: Vec<u8>,
+    max_event_bytes: usize,
+}
 
-    // Normalize \r\n to \n in-place.
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            buf.remove(i);
-        } else {
-            i += 1;
+#[derive(Debug, PartialEq, Eq)]
+pub struct SseBufferOverflow;
+
+impl SseSplitter {
+    pub fn new(max_event_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_event_bytes,
         }
     }
 
-    let mut events = Vec::new();
-    let mut consumed = 0;
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseBufferOverflow> {
+        let mut events = Vec::new();
 
-    while let Some(sep) = buf[consumed..]
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|p| consumed + p)
-    {
-        // Find next \n\n delimiter.
-        let event_bytes = &buf[consumed..sep];
-        if let Some(ev) = parse_event(event_bytes) {
-            events.push(ev);
+        for &b in chunk {
+            self.buf.push(b);
+
+            if let Some((event_len, delimiter_len)) = complete_event(&self.buf) {
+                let event_bytes = &self.buf[..event_len];
+                if let Some(ev) = parse_event(event_bytes) {
+                    events.push(ev);
+                }
+                self.buf.drain(..event_len + delimiter_len);
+                continue;
+            }
+
+            if self.buf.len() > self.max_event_bytes {
+                self.buf.clear();
+                return Err(SseBufferOverflow);
+            }
         }
-        consumed = sep + 2;
-    }
 
-    buf.drain(..consumed);
-    events
+        Ok(events)
+    }
+}
+
+fn complete_event(buf: &[u8]) -> Option<(usize, usize)> {
+    if buf.ends_with(b"\r\n\r\n") {
+        Some((buf.len() - 4, 4))
+    } else if buf.ends_with(b"\n\n") {
+        Some((buf.len() - 2, 2))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,6 +61,7 @@ fn parse_event(blob: &[u8]) -> Option<SseEvent> {
     let mut data_parts: Vec<&str> = Vec::new();
 
     for line in blob.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.starts_with(b"event:") {
             event_type = std::str::from_utf8(&line[6..])
                 .unwrap_or("")
@@ -72,39 +89,42 @@ fn parse_event(blob: &[u8]) -> Option<SseEvent> {
 mod tests {
     use super::*;
 
+    fn split_all(splitter: &mut SseSplitter, chunk: &[u8]) -> Vec<SseEvent> {
+        splitter.push(chunk).unwrap()
+    }
+
     #[test]
     fn single_event() {
-        let mut buf = Vec::new();
+        let mut splitter = SseSplitter::new(1024);
         let chunk = b"event: message_start\ndata: {\"type\":\"start\"}\n\n";
-        let events = split_events(&mut buf, chunk);
+        let events = split_all(&mut splitter, chunk);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "message_start");
         assert_eq!(events[0].data, "{\"type\":\"start\"}");
-        assert!(buf.is_empty());
     }
 
     #[test]
     fn split_across_chunks() {
-        let mut buf = Vec::new();
-        let e1 = split_events(&mut buf, b"event: foo\ndata: hello");
+        let mut splitter = SseSplitter::new(1024);
+        let e1 = split_all(&mut splitter, b"event: foo\ndata: hello");
         assert!(e1.is_empty()); // no \n\n yet
-        let e2 = split_events(&mut buf, b"\n\n");
+        let e2 = split_all(&mut splitter, b"\n\n");
         assert_eq!(e2.len(), 1);
         assert_eq!(e2[0].data, "hello");
     }
 
     #[test]
     fn done_sentinel_skipped() {
-        let mut buf = Vec::new();
-        let events = split_events(&mut buf, b"data: [DONE]\n\n");
+        let mut splitter = SseSplitter::new(1024);
+        let events = split_all(&mut splitter, b"data: [DONE]\n\n");
         assert!(events.is_empty());
     }
 
     #[test]
     fn multiple_events_in_one_chunk() {
-        let mut buf = Vec::new();
+        let mut splitter = SseSplitter::new(1024);
         let chunk = b"data: first\n\ndata: second\n\n";
-        let events = split_events(&mut buf, chunk);
+        let events = split_all(&mut splitter, chunk);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "first");
         assert_eq!(events[1].data, "second");
@@ -112,10 +132,22 @@ mod tests {
 
     #[test]
     fn crlf_normalized() {
-        let mut buf = Vec::new();
-        let events = split_events(&mut buf, b"data: crlf\r\n\r\n");
+        let mut splitter = SseSplitter::new(1024);
+        let events = split_all(&mut splitter, b"data: crlf\r\n\r\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "crlf");
+    }
+
+    #[test]
+    fn overflow_is_reported_and_buffer_is_cleared() {
+        let mut splitter = SseSplitter::new(9);
+        assert_eq!(
+            splitter.push(b"data: too long without delimiter"),
+            Err(SseBufferOverflow)
+        );
+        let events = split_all(&mut splitter, b"data:ok\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "ok");
     }
 }
 
@@ -151,11 +183,11 @@ mod prop_tests {
             }
 
             // Collect reference events from a single-chunk parse.
-            let mut ref_buf = Vec::new();
-            let reference = split_events(&mut ref_buf, &stream);
+            let mut ref_splitter = SseSplitter::new(4096);
+            let reference = ref_splitter.push(&stream).unwrap();
 
             // Collect events from the chunked parse.
-            let mut test_buf = Vec::new();
+            let mut test_splitter = SseSplitter::new(4096);
             let mut got: Vec<SseEvent> = Vec::new();
             let mut prev = 0;
             let mut points: Vec<usize> = split_points.into_iter()
@@ -167,7 +199,7 @@ mod prop_tests {
             for &pt in &points {
                 if pt > stream.len() { continue; }
                 if pt <= prev { continue; }
-                got.extend(split_events(&mut test_buf, &stream[prev..pt]));
+                got.extend(test_splitter.push(&stream[prev..pt]).unwrap());
                 prev = pt;
             }
 

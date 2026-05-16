@@ -2,8 +2,8 @@ use crate::json_usage::JsonUsageExtractor;
 use crate::parsers::{model_from_request_body, model_from_response_value};
 use crate::paths::calls_db;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
-use crate::record::{classify_error, Record, Store, Usage};
-use crate::sse::split_events;
+use crate::record::{classify_error, Record, Store, TotalTokenSemantics, Usage};
+use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::State;
@@ -31,6 +31,7 @@ struct ProxyState {
 }
 
 const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 const BODY_CHANNEL_CAP: usize = 4;
 const OBSERVER_CHANNEL_CAP: usize = 4;
 
@@ -45,6 +46,7 @@ struct RecordBase {
     status: Option<u16>,
     stream: bool,
     request_id: Option<String>,
+    total_token_semantics: TotalTokenSemantics,
     started: Instant,
 }
 
@@ -186,7 +188,8 @@ async fn handle_request(
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
-            let kind = classify_error(&e.to_string());
+            let message = sanitized_reqwest_error(&e);
+            let kind = classify_error(&message);
             let rec = Record {
                 id: call_id,
                 ts,
@@ -207,7 +210,7 @@ async fn handle_request(
                 reasoning_output_tokens: None,
                 request_id: None,
                 error_kind: Some(kind.to_string()),
-                error_message: Some(e.to_string()),
+                error_message: Some(message),
                 cost: None,
             };
             spawn_record_write(state.store.clone(), rec);
@@ -250,6 +253,7 @@ async fn handle_request(
         status: Some(status.as_u16()),
         stream: is_sse,
         request_id,
+        total_token_semantics: provider.total_token_semantics,
         started: t0,
     };
 
@@ -283,8 +287,8 @@ async fn handle_request(
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
-                    let kind = classify_error(&e.to_string()).to_string();
-                    let message = e.to_string();
+                    let message = sanitized_reqwest_error(&e);
+                    let kind = classify_error(&message).to_string();
                     let _ = body_tx
                         .send(Err(std::io::Error::other(message.clone())))
                         .await;
@@ -353,7 +357,10 @@ fn spawn_observer(
     let handle = tokio::spawn(async move {
         let mut usage = Usage::default();
         let mut ttft_ms: Option<u64> = None;
-        let mut sse_buf: Vec<u8> = Vec::new();
+        let mut sse_splitter = match &kind {
+            ObserverKind::Sse { .. } => Some(SseSplitter::new(MAX_SSE_EVENT_BYTES)),
+            ObserverKind::Json { .. } => None,
+        };
         let mut json_extractor = match &kind {
             ObserverKind::Json { usage_key, .. } => Some(JsonUsageExtractor::new(usage_key)),
             ObserverKind::Sse { .. } => None,
@@ -371,7 +378,17 @@ fn spawn_observer(
                             if ttft_ms.is_none() && !bytes.is_empty() {
                                 ttft_ms = Some(elapsed_ms);
                             }
-                            for event in split_events(&mut sse_buf, &bytes) {
+                            let Some(splitter) = sse_splitter.as_mut() else {
+                                continue;
+                            };
+                            let events = match splitter.push(&bytes) {
+                                Ok(events) => events,
+                                Err(_) => {
+                                    dropped.store(true, Ordering::Relaxed);
+                                    continue;
+                                }
+                            };
+                            for event in events {
                                 if !should_parse_sse_event(&event.event_type, &event.data) {
                                     continue;
                                 }
@@ -403,11 +420,15 @@ fn spawn_observer(
                         usage = Usage::default();
                     } else if let ObserverKind::Json { parse, enabled, .. } = kind {
                         if enabled {
-                            usage = json_extractor
-                                .take()
-                                .and_then(JsonUsageExtractor::finish_wrapped)
-                                .map(|v| parse(&v))
-                                .unwrap_or_default();
+                            if let Some(extractor) = json_extractor.take() {
+                                if base.model.is_none() {
+                                    base.model = extractor.model().map(String::from);
+                                }
+                                usage = extractor
+                                    .finish_wrapped()
+                                    .map(|v| parse(&v))
+                                    .unwrap_or_default();
+                            }
                         }
                     }
                     spawn_record_write(
@@ -489,7 +510,7 @@ fn record_from_base(
         stream: base.stream,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
-        total_tokens: usage.total(),
+        total_tokens: usage.total(base.total_token_semantics),
         cache_read_input_tokens: usage.cache_read_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_hit: usage.cache_hit(),
@@ -604,6 +625,26 @@ fn is_hop_by_hop_header(name: &HeaderName, connection_tokens: &[String]) -> bool
         .any(|token| token.eq_ignore_ascii_case(name))
 }
 
+fn sanitized_reqwest_error(err: &reqwest::Error) -> String {
+    sanitize_error_message(&err.to_string(), err.url())
+}
+
+fn sanitize_error_message(message: &str, url: Option<&reqwest::Url>) -> String {
+    let Some(url) = url else {
+        return message.to_string();
+    };
+    message.replace(url.as_str(), &redacted_url(url))
+}
+
+fn redacted_url(url: &reqwest::Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
+}
+
 /// If the body is a streaming JSON request (`"stream": true`), inject
 /// `stream_options: {"include_usage": true}` so the final SSE chunk carries
 /// token counts. Falls back to the original bytes on any parse failure.
@@ -617,13 +658,22 @@ fn maybe_inject_stream_options(body: Bytes) -> Bytes {
     if obj.get("stream").and_then(|v| v.as_bool()) != Some(true) {
         return body;
     }
-    let so = obj
-        .entry("stream_options")
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(so_obj) = so.as_object_mut() {
-        so_obj
-            .entry("include_usage")
-            .or_insert(serde_json::json!(true));
+    match obj.get_mut("stream_options") {
+        Some(Value::Object(so)) => {
+            so.insert("include_usage".to_string(), serde_json::json!(true));
+        }
+        Some(_) => {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+        None => {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
     }
     serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
 }
@@ -678,16 +728,26 @@ mod tests {
     }
 
     #[test]
-    fn inject_does_not_overwrite_existing_include_usage() {
+    fn inject_overwrites_existing_include_usage() {
         let out = maybe_inject_stream_options(bytes(json!({
             "model": "gpt-4o",
             "stream": true,
             "stream_options": {"include_usage": false, "extra": 1}
         })));
         let v: Value = serde_json::from_slice(&out).unwrap();
-        // or_insert must not overwrite an existing value
-        assert_eq!(v["stream_options"]["include_usage"], json!(false));
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
         assert_eq!(v["stream_options"]["extra"], json!(1));
+    }
+
+    #[test]
+    fn inject_replaces_invalid_stream_options() {
+        let out = maybe_inject_stream_options(bytes(json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "stream_options": false
+        })));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
     }
 
     #[test]
@@ -727,5 +787,23 @@ mod tests {
         ] {
             assert!(!is_inference_endpoint(e), "{e} should be skipped");
         }
+    }
+
+    #[test]
+    fn error_url_is_redacted_before_persistence() {
+        let url = reqwest::Url::parse(
+            "https://user:secret@api.example.com/v1/messages?api_key=sk-secret&alt=sse#frag",
+        )
+        .unwrap();
+        let message = format!("error sending request for url ({url})");
+        let sanitized = sanitize_error_message(&message, Some(&url));
+
+        assert!(!sanitized.contains("sk-secret"));
+        assert!(!sanitized.contains("user:secret"));
+        assert!(!sanitized.contains("alt=sse"));
+        assert_eq!(
+            sanitized,
+            "error sending request for url (https://api.example.com/v1/messages)"
+        );
     }
 }
