@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-const EMBEDDED: &str = include_str!("../prices.json");
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
@@ -26,9 +25,60 @@ pub struct Rates {
     pub cache_in_input: bool,
 }
 
+/// Built-in price table. Keys are lowercase model names or name prefixes;
+/// the lookup uses longest-prefix match as a fallback, so a key like
+/// "deepseek-v" covers "deepseek-v3", "deepseek-v4-pro", etc.
+fn default_rates() -> HashMap<String, Rates> {
+    macro_rules! r {
+        ($inp:expr, $out:expr, $cr:expr, $cw:expr, $cii:expr) => {
+            Rates {
+                input_per_m: $inp,
+                output_per_m: $out,
+                cache_read_per_m: $cr,
+                cache_creation_per_m: $cw,
+                cache_in_input: $cii,
+            }
+        };
+    }
+    [
+        // Anthropic — cache is additive (not included in input_tokens)
+        ("claude-opus-4",     r!(15.0,  75.0,  1.5,    18.75, false)),
+        ("claude-4-opus",     r!(15.0,  75.0,  1.5,    18.75, false)),
+        ("claude-3-opus",     r!(15.0,  75.0,  1.5,    18.75, false)),
+        ("claude-sonnet-4",   r!( 3.0,  15.0,  0.3,     3.75, false)),
+        ("claude-4-sonnet",   r!( 3.0,  15.0,  0.3,     3.75, false)),
+        ("claude-3-7-sonnet", r!( 3.0,  15.0,  0.3,     3.75, false)),
+        ("claude-3-5-sonnet", r!( 3.0,  15.0,  0.3,     3.75, false)),
+        ("claude-3-sonnet",   r!( 3.0,  15.0,  0.3,     3.75, false)),
+        ("claude-haiku-4",    r!( 0.8,   4.0,  0.08,    1.0,  false)),
+        ("claude-3-5-haiku",  r!( 0.8,   4.0,  0.08,    1.0,  false)),
+        ("claude-3-haiku",    r!( 0.25,  1.25, 0.03,    0.3,  false)),
+        // OpenAI — cache included in input_tokens
+        ("gpt-4o-mini",       r!( 0.15,  0.6,  0.075,   0.0,  true)),
+        ("gpt-4o",            r!( 2.5,  10.0,  1.25,    0.0,  true)),
+        ("o1-mini",           r!( 1.1,   4.4,  0.55,    0.0,  true)),
+        ("o1",                r!(15.0,  60.0,  7.5,     0.0,  true)),
+        ("o3-mini",           r!( 1.1,   4.4,  0.55,    0.0,  true)),
+        ("o3",                r!(10.0,  40.0,  2.5,     0.0,  true)),
+        // DeepSeek — cache included in input_tokens
+        ("deepseek-chat",     r!( 0.27,  1.10, 0.07,    0.0,  true)),
+        ("deepseek-v",        r!( 0.27,  1.10, 0.07,    0.0,  true)),
+        ("deepseek-reasoner", r!( 0.55,  2.19, 0.14,    0.0,  true)),
+        ("deepseek-r1",       r!( 0.55,  2.19, 0.14,    0.0,  true)),
+        // Gemini — cache included in input_tokens
+        ("gemini-2.5-pro",    r!( 1.25, 10.0,  0.315,   0.0,  true)),
+        ("gemini-2.0-flash",  r!( 0.10,  0.40, 0.025,   0.0,  true)),
+        ("gemini-1.5-pro",    r!( 1.25,  5.0,  0.3125,  0.0,  true)),
+        ("gemini-1.5-flash",  r!( 0.075, 0.30, 0.01875, 0.0,  true)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
 struct PriceTable {
     /// Keys are lowercase model names or prefixes. Local file entries overlay
-    /// embedded entries so exact versioned names win over embedded prefixes.
+    /// the built-in defaults so exact versioned names win over prefix fallbacks.
     map: HashMap<String, Rates>,
 }
 
@@ -42,13 +92,13 @@ impl PriceTable {
     }
 
     fn load(local_path: &Path) -> Self {
-        let mut map = Self::from_json(EMBEDDED).expect("embedded prices.json must be valid JSON");
+        let mut map = default_rates();
 
         if let Ok(src) = std::fs::read_to_string(local_path) {
             match Self::from_json(&src) {
                 Ok(local) => {
-                    // Local entries overlay embedded ones; prefix fallbacks from
-                    // embedded still apply for any model absent from the local file.
+                    // Local entries overlay built-in ones; prefix fallbacks from
+                    // defaults still apply for any model absent from the local file.
                     map.extend(local);
                 }
                 Err(e) => {
@@ -175,8 +225,7 @@ pub async fn pull(dest: &Path) -> Result<()> {
 
 /// Print the active price table source and model count.
 pub fn show(local_path: &Path) {
-    let embedded: HashMap<String, Rates> =
-        serde_json::from_str(EMBEDDED).expect("embedded prices.json must be valid");
+    let n_default = default_rates().len();
 
     if local_path.exists() {
         match std::fs::read_to_string(local_path)
@@ -184,26 +233,22 @@ pub fn show(local_path: &Path) {
             .and_then(|s| serde_json::from_str::<HashMap<String, Rates>>(&s).ok())
         {
             Some(local) => {
-                let total = embedded.len() + local.len(); // approximate; may overlap
                 println!(
-                    "source: {} ({} models) overlaid on embedded ({} models); ~{total} total",
+                    "source: {} ({} models) overlaid on built-in defaults ({n_default} models)",
                     local_path.display(),
                     local.len(),
-                    embedded.len(),
                 );
             }
             None => {
                 println!(
-                    "source: embedded default ({} models) — {} is unreadable",
-                    embedded.len(),
+                    "source: built-in defaults ({n_default} models) — {} is unreadable",
                     local_path.display()
                 );
             }
         }
     } else {
         println!(
-            "source: embedded default ({} models) — run `toll prices pull` to fetch latest",
-            embedded.len()
+            "source: built-in defaults ({n_default} models) — run `toll prices pull` to fetch latest"
         );
     }
 }
@@ -213,9 +258,7 @@ mod tests {
     use super::*;
 
     fn table() -> PriceTable {
-        PriceTable {
-            map: PriceTable::from_json(EMBEDDED).unwrap(),
-        }
+        PriceTable { map: default_rates() }
     }
 
     fn usage(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> Usage {
