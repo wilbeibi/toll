@@ -2,6 +2,8 @@
 
 Project-specific guidance for toll.
 
+**Read [`DESIGN.md`](DESIGN.md) before any non-trivial change.** It holds the philosophy, architecture, and load-bearing invariants. This file is the operational contract (how to work the repo safely); `DESIGN.md` explains *why* the code is shaped the way it is. If a change fights an invariant in `DESIGN.md`, the change is wrong until that document is deliberately revised.
+
 ## Repo at a glance
 - Rust 2021 single-binary project. Binary name: `toll`.
 - A localhost reverse proxy and usage meter for LLM API calls. Binds only to `127.0.0.1`.
@@ -45,6 +47,7 @@ rtk systemctl --user status toll.service --no-pager --lines=20
 Do not use `sudo` from an agent session — ask the user to run elevated commands in a separate terminal.
 
 ## Hard rules for changes
+These are the operational shorthand; the rationale and the full invariant list are in [`DESIGN.md`](DESIGN.md).
 - **`Record` schema is locked.** New fields must be optional, appended, forward-migrated, and covered by tests. Renames or removals require an explicit version bump and a changelog entry.
 - **Don't change client app source.** If a provider can be redirected by config (`OPENAI_BASE_URL` etc.), do that instead.
 - **Preserve streaming behavior.** Keep `stream_options.include_usage` injection for OpenAI-compatible providers unless the upstream genuinely cannot support it. Anthropic and Gemini report usage via their own SSE events — don't break those paths.

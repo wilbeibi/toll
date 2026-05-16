@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::warn;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -11,6 +12,9 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
+    /// Provider-reported billed cost in USD, when the response includes it
+    /// (e.g. OpenRouter's `usage.cost`). Authoritative — no price lookup needed.
+    pub cost: Option<f64>,
 }
 
 impl Usage {
@@ -28,6 +32,7 @@ impl Usage {
         take!(cache_read_input_tokens);
         take!(cache_creation_input_tokens);
         take!(reasoning_output_tokens);
+        take!(cost);
     }
 
     pub fn cache_hit(&self) -> Option<bool> {
@@ -74,6 +79,7 @@ pub struct Record {
     pub request_id: Option<String>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    pub cost: Option<f64>,
 }
 
 pub struct Store {
@@ -89,6 +95,19 @@ impl Store {
         let store = Self { conn };
         store.init()?;
         Ok(store)
+    }
+
+    /// Run on clean shutdown: fold the WAL back into the main DB so the file
+    /// is compact at rest, and refresh the query planner's stats. The pragmas
+    /// during normal operation are already write-optimal; this is the only
+    /// piece that needs an explicit lifecycle hook.
+    pub fn checkpoint(&self) {
+        if let Err(e) = self
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
+        {
+            warn!("toll: shutdown checkpoint failed: {e}");
+        }
     }
 
     fn init(&self) -> Result<()> {
@@ -121,14 +140,18 @@ impl Store {
                 reasoning_output_tokens     INTEGER,
                 request_id                  TEXT,
                 error_kind                  TEXT,
-                error_message               TEXT
+                error_message               TEXT,
+                cost                        REAL
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
             CREATE INDEX IF NOT EXISTS idx_model    ON calls(model);",
         )?;
         // Forward-compatible: ignore duplicate column errors on existing DBs.
-        for sql in &["ALTER TABLE calls ADD COLUMN reasoning_output_tokens INTEGER"] {
+        for sql in &[
+            "ALTER TABLE calls ADD COLUMN reasoning_output_tokens INTEGER",
+            "ALTER TABLE calls ADD COLUMN cost REAL",
+        ] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 if !e.to_string().contains("duplicate column name") {
                     return Err(e.into());
@@ -146,8 +169,8 @@ impl Store {
                 input_tokens, output_tokens, total_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_hit, reasoning_output_tokens,
-                request_id, error_kind, error_message
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                request_id, error_kind, error_message, cost
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 r.id,
                 r.ts,
@@ -169,6 +192,7 @@ impl Store {
                 r.request_id,
                 r.error_kind,
                 r.error_message,
+                r.cost,
             ],
         )?;
         Ok(())
@@ -232,7 +256,7 @@ impl Store {
                         input_tokens, output_tokens, total_tokens,
                         cache_read_input_tokens, cache_creation_input_tokens,
                         cache_hit, reasoning_output_tokens,
-                        request_id, error_kind, error_message
+                        request_id, error_kind, error_message, cost
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -259,6 +283,7 @@ impl Store {
                         request_id: row.get(17)?,
                         error_kind: row.get(18)?,
                         error_message: row.get(19)?,
+                        cost: row.get::<_, Option<f64>>(20)?,
                     })
                 },
             )
@@ -361,6 +386,7 @@ mod tests {
             request_id: Some("req_xyz".into()),
             error_kind: None,
             error_message: None,
+            cost: None,
         }
     }
 
