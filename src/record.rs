@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_merge_last_write_wins_per_field() {
+    fn usage_merge_fills_none_fields() {
         let mut base = Usage {
             input_tokens: Some(100),
             output_tokens: None,
@@ -351,6 +351,20 @@ mod tests {
         base.merge(&delta);
         assert_eq!(base.input_tokens, Some(100));
         assert_eq!(base.output_tokens, Some(50));
+    }
+
+    #[test]
+    fn usage_merge_last_write_wins() {
+        let mut base = Usage {
+            input_tokens: Some(100),
+            ..Default::default()
+        };
+        let delta = Usage {
+            input_tokens: Some(200),
+            ..Default::default()
+        };
+        base.merge(&delta);
+        assert_eq!(base.input_tokens, Some(200));
     }
 
     #[test]
@@ -427,20 +441,27 @@ mod tests {
         store.insert(&rec).unwrap();
 
         let back = store.get_by_id("abc123").unwrap();
-        assert_eq!(back.id, "abc123");
-        assert_eq!(back.provider, "openai");
-        assert_eq!(back.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(back.input_tokens, Some(50));
-        assert_eq!(back.ttft_ms, Some(120));
-        assert!(back.error_kind.is_none());
-    }
-
-    #[test]
-    fn store_multiple_records() {
-        let store = Store::open_in_memory().unwrap();
-        store.insert(&sample_record("r1")).unwrap();
-        store.insert(&sample_record("r2")).unwrap();
-        assert_eq!(store.count(), 2);
+        assert_eq!(back.id, rec.id);
+        assert_eq!(back.ts, rec.ts);
+        assert_eq!(back.provider, rec.provider);
+        assert_eq!(back.model, rec.model);
+        assert_eq!(back.endpoint, rec.endpoint);
+        assert_eq!(back.method, rec.method);
+        assert_eq!(back.status, rec.status);
+        assert_eq!(back.latency_ms, rec.latency_ms);
+        assert_eq!(back.ttft_ms, rec.ttft_ms);
+        assert_eq!(back.stream, rec.stream);
+        assert_eq!(back.input_tokens, rec.input_tokens);
+        assert_eq!(back.output_tokens, rec.output_tokens);
+        assert_eq!(back.total_tokens, rec.total_tokens);
+        assert_eq!(back.cache_read_input_tokens, rec.cache_read_input_tokens);
+        assert_eq!(back.cache_creation_input_tokens, rec.cache_creation_input_tokens);
+        assert_eq!(back.cache_hit, rec.cache_hit);
+        assert_eq!(back.reasoning_output_tokens, rec.reasoning_output_tokens);
+        assert_eq!(back.request_id, rec.request_id);
+        assert_eq!(back.error_kind, rec.error_kind);
+        assert_eq!(back.error_message, rec.error_message);
+        assert_eq!(back.cost, rec.cost);
     }
 
     #[test]

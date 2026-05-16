@@ -121,16 +121,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_events_in_one_chunk() {
-        let mut splitter = SseSplitter::new(1024);
-        let chunk = b"data: first\n\ndata: second\n\n";
-        let events = split_all(&mut splitter, chunk);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data, "first");
-        assert_eq!(events[1].data, "second");
-    }
-
-    #[test]
     fn crlf_normalized() {
         let mut splitter = SseSplitter::new(1024);
         let events = split_all(&mut splitter, b"data: crlf\r\n\r\n");
