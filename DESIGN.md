@@ -1,10 +1,20 @@
 # DESIGN.md — toll
 
-The philosophy, architecture, and invariants behind toll. Read this before
-any non-trivial change. `AGENTS.md` holds the operational contract; this
-document explains *why* the code is shaped the way it is. When a change
-fights an invariant here, the change is wrong until this document is
-deliberately revised.
+The architecture and invariants behind toll. `AGENTS.md` holds the
+operational contract; this document is the rule set for changing the
+code. When a change fights an invariant here, the change is wrong until
+this document is deliberately revised.
+
+## Working procedure
+
+Before changing code:
+
+1. Identify which invariant(s) below the change touches — each names its
+   code locus and the test that proves it.
+2. If the change fights an invariant, stop and surface the conflict. Do
+   not code around it.
+3. Adding a `Record` field: follow invariant 4's checklist exactly.
+4. Verify: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 
 ## What toll is
 
@@ -90,38 +100,67 @@ response body is never fully buffered.
 ## Invariants
 
 These are load-bearing. Changing one is a design decision, not a patch.
+Each states the rule, its code locus, and the test that proves it.
 
-1. **No request mutation** except `stream_options.include_usage` for
-   providers flagged `inject_stream_options`. The request body is
-   otherwise forwarded byte-for-byte.
+1. **No request mutation.** The only edit is `stream_options.include_usage`
+   for providers flagged `inject_stream_options` (`providers.rs`), applied
+   by `maybe_inject_stream_options` (`proxy.rs`) — forced on, not deferred
+   to a client value; the body is otherwise forwarded byte-for-byte. A
+   second mutation site is the violation. Proof:
+   `inject_overwrites_existing_include_usage`,
+   `inject_falls_back_on_invalid_json` (`proxy.rs`).
 2. **Observation never affects the proxied response.** The forward path
-   does not await the observer. The observer channel is bounded and drops
-   on full (`try_observe`). `spawn_record_write` is detached.
-3. **Every buffer is bounded.** Request-body inspection is gated by
-   `Content-Length` ≤ `MAX_MODEL_INSPECT_BYTES`; the usage scanner caps
-   the matched object and disables itself past its limit; SSE and channel
-   buffers are bounded. New code that buffers unbounded input is a bug.
-4. **`Record` is append-only.** New fields: optional, appended, with a
-   forward-compatible `ALTER` that tolerates pre-existing databases, plus
-   a roundtrip test. Renames/removals require a version bump and a
-   changelog entry.
-5. **Record only inference.** `is_inference_endpoint` is an allowlist of
-   token-bearing endpoints, biased toward inclusion (anything that can
-   carry `usage` must match, or cost data is silently lost). It is never
-   an ever-growing denylist of probes.
-6. **Faithful identity.** Store the model exactly as the provider bills
-   it, including the `vendor/` prefix for routers. No transformation that
-   destroys billing identity.
+   never `.await`s the observer; the tee channels are bounded
+   (`BODY_CHANNEL_CAP`, `OBSERVER_CHANNEL_CAP` = 4, `proxy.rs`) and drop
+   on full (`try_observe`); `spawn_record_write` is detached. A forward
+   path that awaits observation is the violation.
+3. **Every buffer is bounded.** Request-body inspection gated by
+   `Content-Length` ≤ `MAX_MODEL_INSPECT_BYTES` (`proxy.rs`); the JSON
+   usage scan caps at `MAX_USAGE_OBJECT_BYTES` and self-disables past it
+   (`JsonUsageExtractor`, `json_usage.rs`); SSE framing caps at
+   `MAX_SSE_EVENT_BYTES` and drops on overflow (`SseSplitter`, `sse.rs`).
+   Unbounded input buffering is the violation. Proof:
+   `overflow_is_reported_and_buffer_is_cleared` (`sse.rs`),
+   `oversized_model_does_not_block_usage_extraction` (`json_usage.rs`).
+4. **`Record` is append-only.** A new field is optional, appended last,
+   with a forward-compatible `ALTER TABLE ... ADD COLUMN` in `Store::init`
+   (`record.rs`) that ignores "duplicate column name" on pre-existing
+   DBs. Renames/removals require a version bump and a changelog entry.
+   Proof: `store_roundtrip` (`record.rs`).
+5. **Record only inference.** `is_inference_endpoint` (`proxy.rs`) is an
+   allowlist of token-bearing path markers, biased toward inclusion
+   (anything that can carry `usage` must match or cost is silently lost);
+   it is the single gate inside `spawn_record_write`. An ever-growing
+   denylist of probes is the violation. Proof:
+   `inference_endpoints_are_recorded` (`proxy.rs`).
+6. **Faithful identity.** The model is stored exactly as the provider
+   bills it, `vendor/` prefix included, and backfilled from the response
+   (`JsonUsageExtractor::model`, `json_usage.rs`) only when the request
+   omits it. Any per-provider model rewrite is the violation (see
+   "Worked example"). Proof: `extracts_top_level_model_across_chunks`,
+   `ignores_nested_or_content_model_strings` (`json_usage.rs`).
 7. **Provider-correct cost.** Cached tokens are a *subset* of input for
-   OpenAI/DeepSeek/Gemini and *additive* for Anthropic; never charge a
-   token twice. Prefer provider-reported `cost` over inferred prices.
-8. **SQLite is a write-optimized embedded log.** WAL,
-   `synchronous=NORMAL`, `busy_timeout`, one long-lived writer behind a
-   `Mutex`. Compaction (`wal_checkpoint(TRUNCATE)` + `optimize`) happens
-   only on clean shutdown — no checkpoint daemon for a non-problem.
-9. **Security.** Bind `127.0.0.1` only. Never log API keys, bearer
-   tokens, or credential-bearing request bodies. Never delete user data
-   unasked.
+   OpenAI/DeepSeek/Gemini (`TotalTokenSemantics::CacheIncludedInInput`)
+   and *additive* for Anthropic (`CacheAdditiveToInput`); `Usage::total`
+   (`record.rs`) applies the per-provider semantics set in `providers.rs`,
+   so a token is never counted twice. Prefer provider-reported
+   `usage.cost` (parsed in `parsers/openai_like.rs`) over any inferred
+   price. Proof: `usage_total_cache_included_in_input`,
+   `usage_total_cache_additive_to_input`,
+   `usage_total_cache_only_is_unknown_when_cache_is_included`
+   (`record.rs`).
+8. **SQLite is a write-optimized embedded log.** `Store` (`record.rs`):
+   WAL, `synchronous=NORMAL`, `busy_timeout=5000`, one long-lived writer
+   behind a `Mutex`. Compaction (`wal_checkpoint(TRUNCATE)` + `optimize`)
+   runs only on clean shutdown via `Store::checkpoint`. A checkpoint
+   daemon is the violation.
+9. **Security.** The listener binds `SocketAddr::from(([127,0,0,1], port))`
+   only (`proxy.rs`, `run_all`/`serve_on`). Never log API keys, bearer
+   tokens, or credential-bearing bodies; error text is passed through
+   `sanitize_error_message`/`redacted_url` (`proxy.rs`), which strip
+   `user:pass`, query, and fragment before persistence. Never delete user
+   data unasked. Proof: `error_url_is_redacted_before_persistence`
+   (`proxy.rs`).
 
 ## Non-goals
 
@@ -144,3 +183,30 @@ hook had collapsed to "identity, plus one wrong case," and **delete the
 hook entirely**. The struct shrank, the proxy lost two indirections, and
 the behavior became correct by construction. That is the default move
 when an abstraction no longer earns its keep.
+
+## Decision ledger — deliberately absent
+
+Evaluated (LiteLLM, Langfuse, Helicone, OpenLLMetry, OpenLIT, Portkey,
+RelayPlane) and kept out. This is negative space the code cannot tell
+you. The answer is "no" until a concrete need overturns it.
+
+- **Local price table — deferred.** Only provider-reported `usage.cost`
+  is stored (invariant 7). A local price table would duplicate a derived
+  value across nearly every row and inherit upstream-pricing staleness.
+  If spend visibility is ever needed, the path is a *separate* price
+  table joined at read time — never a wider `Record` (invariant 4).
+- **Trace/session IDs, attribution headers — rejected.** Speculative
+  request surface, no demonstrated need; grows request inspection
+  against invariant 1.
+- **OTLP/OpenTelemetry export — rejected.** SQLite is the source of
+  truth; an export contract for a nonexistent consumer is bloat.
+- **Real-time SSE log stream — rejected.** `tail` already gives local
+  visibility; a network-facing stream contradicts invariant 9 and the
+  localhost-only non-goal.
+- **Writable-config resilience — rejected.** `toll` config is not
+  writable; machinery for a problem we do not have.
+
+Routing, virtual keys, spend writers, budgets, retries, caching,
+guardrails, ClickHouse/Kafka ingestion, and SDK monkey-patching solve a
+gateway/control-plane problem. `toll` is a local meter (see "What toll
+is" and "Non-goals").
