@@ -14,6 +14,7 @@ struct Row {
     cache_read: i64,
     cache_write: i64,
     errors: i64,
+    cost: f64,
 }
 
 pub fn run(opts: StatsOpts) -> Result<()> {
@@ -37,7 +38,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
                 COALESCE(SUM(output_tokens), 0),
                 COALESCE(SUM(cache_read_input_tokens), 0),
                 COALESCE(SUM(cache_creation_input_tokens), 0),
-                SUM(CASE WHEN error_kind IS NOT NULL THEN 1 ELSE 0 END)
+                SUM(CASE WHEN error_kind IS NOT NULL THEN 1 ELSE 0 END),
+                COALESCE(SUM(cost), 0)
          FROM calls
          GROUP BY grp
          ORDER BY grp"
@@ -54,6 +56,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
                 cache_read: r.get(4)?,
                 cache_write: r.get(5)?,
                 errors: r.get(6)?,
+                cost: r.get(7)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -82,6 +85,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     }
     headers.push("errors");
     widths.push(6);
+    headers.push("cost_usd");
+    widths.push(10);
 
     print_row(
         &headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -102,6 +107,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             cols.push(row.cache_write.to_string());
         }
         cols.push(row.errors.to_string());
+        cols.push(format!("{:.4}", row.cost));
         print_row(&cols, &widths);
     }
 

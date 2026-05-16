@@ -3,6 +3,7 @@ mod config;
 mod json_usage;
 mod parsers;
 mod paths;
+mod pricing;
 mod providers;
 mod proxy;
 mod record;
@@ -29,6 +30,10 @@ async fn main() -> anyhow::Result<()> {
             },
             provider.as_deref(),
         )?,
+        Command::Prices { cmd } => match cmd {
+            cli::PricesCmd::Pull => pricing::pull(&paths::prices_json()).await?,
+            cli::PricesCmd::Show => pricing::show(&paths::prices_json()),
+        },
     }
 
     Ok(())

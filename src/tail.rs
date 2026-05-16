@@ -11,8 +11,8 @@ struct Row {
     input: Option<u64>,
     output: Option<u64>,
     cache_read: Option<u64>,
-    cache_hit: Option<bool>,
     error_kind: Option<String>,
+    cost: Option<f64>,
 }
 
 pub fn run(n: usize) -> Result<()> {
@@ -26,7 +26,7 @@ pub fn run(n: usize) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT ts, provider, model, status, latency_ms,
                 input_tokens, output_tokens,
-                cache_read_input_tokens, cache_hit, error_kind
+                cache_read_input_tokens, error_kind, cost
          FROM calls
          ORDER BY rowid DESC
          LIMIT ?1",
@@ -43,8 +43,8 @@ pub fn run(n: usize) -> Result<()> {
                 input: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                 output: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                 cache_read: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                cache_hit: r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
-                error_kind: r.get(9)?,
+                error_kind: r.get(8)?,
+                cost: r.get(9)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -69,18 +69,23 @@ fn print_row(r: &Row) {
         (Some(i), None) => format!("{i}→?"),
         _ => "?".into(),
     };
-    let cache = if r.cache_hit.unwrap_or(false) {
+    let cache_hit = r.cache_read.map(|n| n > 0).unwrap_or(false);
+    let cache = if cache_hit {
         format!(" cache_read={}", r.cache_read.unwrap_or(0))
     } else {
         String::new()
     };
+    let cost = r
+        .cost
+        .map(|c| format!(" ${c:.4}"))
+        .unwrap_or_default();
     let err = r
         .error_kind
         .as_deref()
         .map(|k| format!(" ERROR={k}"))
         .unwrap_or_default();
     println!(
-        "[{}] {} {} {} {}ms tokens={}{}{}",
-        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, err,
+        "[{}] {} {} {} {}ms tokens={}{}{}{}",
+        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err,
     );
 }

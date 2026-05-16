@@ -2,7 +2,7 @@ use crate::parsers::{
     merge_anthropic_sse, merge_gemini_sse, merge_openai_sse, parse_anthropic, parse_gemini,
     parse_openai,
 };
-use crate::record::{TotalTokenSemantics, Usage};
+use crate::record::Usage;
 use serde_json::Value;
 
 pub type ParseJson = fn(&Value) -> Usage;
@@ -18,8 +18,6 @@ pub struct Provider {
     /// Top-level non-streaming response field that carries usage accounting.
     pub json_usage_key: &'static str,
     pub merge_sse: MergeSse,
-    /// How to derive `total_tokens` when the provider does not report one.
-    pub total_token_semantics: TotalTokenSemantics,
     /// If Some, model is extracted from the request path instead of body.
     pub model_from_path: Option<fn(&str) -> Option<String>>,
     /// Shell export template. `{port}` is substituted at print time.
@@ -50,7 +48,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_anthropic,
         json_usage_key: "usage",
         merge_sse: merge_anthropic_sse,
-        total_token_semantics: TotalTokenSemantics::CacheAdditiveToInput,
         model_from_path: None,
         env_template: Some("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}"),
         inject_stream_options: false,
@@ -63,7 +60,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
@@ -76,7 +72,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
@@ -89,7 +84,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/api/v1"),
         inject_stream_options: true,
@@ -102,7 +96,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_gemini,
         json_usage_key: "usageMetadata",
         merge_sse: merge_gemini_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: Some(gemini_model_from_path),
         env_template: None,
         inject_stream_options: false,
@@ -115,7 +108,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
@@ -128,7 +120,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
@@ -141,7 +132,6 @@ pub static PROVIDERS: &[Provider] = &[
         parse_json: parse_openai,
         json_usage_key: "usage",
         merge_sse: merge_openai_sse,
-        total_token_semantics: TotalTokenSemantics::CacheIncludedInInput,
         model_from_path: None,
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/api/paas/v4"),
         inject_stream_options: true,

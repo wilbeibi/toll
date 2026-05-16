@@ -1,8 +1,9 @@
 use crate::json_usage::JsonUsageExtractor;
 use crate::parsers::{model_from_request_body, model_from_response_value};
 use crate::paths::calls_db;
+use crate::pricing;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
-use crate::record::{classify_error, Record, Store, TotalTokenSemantics, Usage};
+use crate::record::{classify_error, Record, Store, Usage};
 use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
@@ -42,11 +43,8 @@ struct RecordBase {
     provider: String,
     model: Option<String>,
     endpoint: String,
-    method: String,
     status: Option<u16>,
     stream: bool,
-    request_id: Option<String>,
-    total_token_semantics: TotalTokenSemantics,
     started: Instant,
 }
 
@@ -80,6 +78,7 @@ enum ObserverKind {
 }
 
 pub async fn run_all() -> Result<()> {
+    crate::pricing::init(&crate::paths::prices_json());
     let client = Client::builder().use_rustls_tls().build()?;
     let store = Arc::new(Mutex::new(Store::open(&calls_db())?));
 
@@ -130,7 +129,6 @@ async fn handle_request(
 
     let (parts, body) = req.into_parts();
     let method = parts.method;
-    let method_string = method.to_string();
     let uri = parts.uri;
     let path = uri.path();
     let headers = parts.headers;
@@ -190,42 +188,33 @@ async fn handle_request(
         Err(e) => {
             let message = sanitized_reqwest_error(&e);
             let kind = classify_error(&message);
-            let rec = Record {
-                id: call_id,
-                ts,
-                provider: provider.name.to_string(),
-                model,
-                endpoint,
-                method: method_string,
-                status: None,
-                latency_ms: t0.elapsed().as_millis() as u64,
-                ttft_ms: None,
-                stream: false,
-                input_tokens: None,
-                output_tokens: None,
-                total_tokens: None,
-                cache_read_input_tokens: None,
-                cache_creation_input_tokens: None,
-                cache_hit: None,
-                reasoning_output_tokens: None,
-                request_id: None,
-                error_kind: Some(kind.to_string()),
-                error_message: Some(message),
-                cost: None,
-            };
-            spawn_record_write(state.store.clone(), rec);
+            if is_inference_endpoint(&endpoint) {
+                let rec = Record {
+                    id: call_id,
+                    ts,
+                    provider: provider.name.to_string(),
+                    model,
+                    status: None,
+                    latency_ms: t0.elapsed().as_millis() as u64,
+                    ttft_ms: None,
+                    stream: false,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_output_tokens: None,
+                    error_kind: Some(kind.to_string()),
+                    error_message: Some(message),
+                    cost: None,
+                };
+                spawn_record_write(state.store.clone(), rec);
+            }
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let request_id = resp_headers
-        .get("x-request-id")
-        .or_else(|| resp_headers.get("anthropic-request-id"))
-        .or_else(|| resp_headers.get("openai-request-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
 
     let is_sse = resp_headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -249,11 +238,8 @@ async fn handle_request(
         provider: provider.name.to_string(),
         model,
         endpoint,
-        method: method_string,
         status: Some(status.as_u16()),
         stream: is_sse,
-        request_id,
-        total_token_semantics: provider.total_token_semantics,
         started: t0,
     };
 
@@ -431,10 +417,12 @@ fn spawn_observer(
                             }
                         }
                     }
-                    spawn_record_write(
-                        store,
-                        record_from_base(&base, usage, elapsed_ms, ttft_ms, None, None),
-                    );
+                    if is_inference_endpoint(&base.endpoint) {
+                        spawn_record_write(
+                            store,
+                            record_from_base(&base, usage, elapsed_ms, ttft_ms, None, None),
+                        );
+                    }
                     return;
                 }
                 ObserveMsg::UpstreamError {
@@ -445,34 +433,38 @@ fn spawn_observer(
                     if dropped.load(Ordering::Relaxed) {
                         usage = Usage::default();
                     }
-                    spawn_record_write(
-                        store,
-                        record_from_base(
-                            &base,
-                            usage,
-                            elapsed_ms,
-                            ttft_ms,
-                            Some(kind),
-                            Some(message),
-                        ),
-                    );
+                    if is_inference_endpoint(&base.endpoint) {
+                        spawn_record_write(
+                            store,
+                            record_from_base(
+                                &base,
+                                usage,
+                                elapsed_ms,
+                                ttft_ms,
+                                Some(kind),
+                                Some(message),
+                            ),
+                        );
+                    }
                     return;
                 }
                 ObserveMsg::ClientDisconnect { elapsed_ms } => {
                     if dropped.load(Ordering::Relaxed) {
                         usage = Usage::default();
                     }
-                    spawn_record_write(
-                        store,
-                        record_from_base(
-                            &base,
-                            usage,
-                            elapsed_ms,
-                            ttft_ms,
-                            Some("client_disconnect".to_string()),
-                            Some("downstream client disconnected".to_string()),
-                        ),
-                    );
+                    if is_inference_endpoint(&base.endpoint) {
+                        spawn_record_write(
+                            store,
+                            record_from_base(
+                                &base,
+                                usage,
+                                elapsed_ms,
+                                ttft_ms,
+                                Some("client_disconnect".to_string()),
+                                Some("downstream client disconnected".to_string()),
+                            ),
+                        );
+                    }
                     return;
                 }
             }
@@ -497,28 +489,24 @@ fn record_from_base(
     error_kind: Option<String>,
     error_message: Option<String>,
 ) -> Record {
+    let cost = pricing::compute_cost(base.model.as_deref(), &usage);
     Record {
         id: base.id.clone(),
         ts: base.ts.clone(),
         provider: base.provider.clone(),
         model: base.model.clone(),
-        endpoint: base.endpoint.clone(),
-        method: base.method.clone(),
         status: base.status,
         latency_ms,
         ttft_ms,
         stream: base.stream,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
-        total_tokens: usage.total(base.total_token_semantics),
         cache_read_input_tokens: usage.cache_read_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        cache_hit: usage.cache_hit(),
         reasoning_output_tokens: usage.reasoning_output_tokens,
-        request_id: base.request_id.clone(),
         error_kind,
         error_message,
-        cost: usage.cost,
+        cost,
     }
 }
 
@@ -544,9 +532,6 @@ fn is_inference_endpoint(endpoint: &str) -> bool {
 }
 
 fn spawn_record_write(store: Arc<Mutex<Store>>, record: Record) {
-    if !is_inference_endpoint(&record.endpoint) {
-        return;
-    }
     let handle = tokio::task::spawn_blocking(move || {
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = s.insert(&record) {

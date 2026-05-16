@@ -48,7 +48,6 @@ pub fn parse_openai(body: &Value) -> Usage {
     Usage {
         input_tokens,
         output_tokens,
-        total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()),
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: None,
         reasoning_output_tokens: reasoning,
@@ -78,7 +77,6 @@ mod tests {
         }));
         assert_eq!(u.input_tokens, Some(100));
         assert_eq!(u.output_tokens, Some(50));
-        assert_eq!(u.total_tokens, Some(150));
     }
 
     #[test]
@@ -91,7 +89,6 @@ mod tests {
             }
         }));
         assert_eq!(u.cache_read_input_tokens, Some(30));
-        assert_eq!(u.cache_hit(), Some(true));
     }
 
     #[test]
@@ -156,7 +153,7 @@ mod tests {
         );
         merge_openai_sse(
             "",
-            &json!({"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+            &json!({"usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
             &mut u,
         );
         assert_eq!(u.input_tokens, Some(10));
