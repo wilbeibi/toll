@@ -44,6 +44,17 @@ rtk systemctl --user restart toll.service
 rtk systemctl --user status toll.service --no-pager --lines=20
 ```
 
+If asked to redeploy the latest binary:
+
+```zsh
+rtk cargo build --release
+cp target/release/toll ~/.local/bin/toll.new && mv ~/.local/bin/toll.new ~/.local/bin/toll
+rtk systemctl --user restart toll.service
+rtk systemctl --user status toll.service --no-pager --lines=20
+```
+
+The atomic rename (`cp` to `.new` then `mv`) is required because the running binary is memory-mapped and cannot be overwritten directly.
+
 Do not use `sudo` from an agent session — ask the user to run elevated commands in a separate terminal.
 
 ## Hard rules for changes
