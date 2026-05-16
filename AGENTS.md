@@ -20,35 +20,14 @@ Project-specific guidance for toll.
 - `src/stats.rs`, `src/tail.rs` — read-only reporting.
 - `tests/` — integration tests and fixtures.
 
-## Verification commands
-Run from repo root. Prefix with `rtk` per machine policy.
+## Commands (`justfile`)
 
-```zsh
-rtk cargo fmt --all --check
-rtk cargo test
-rtk cargo build --release
-```
-
-Smoke checks against the built binary:
-
-```zsh
-rtk target/release/toll config --format json
-rtk target/release/toll stats
-rtk target/release/toll tail -n 20
-```
-
-If asked to restart the running service:
-
-```zsh
-rtk systemctl --user restart toll.service
-rtk systemctl --user status toll.service --no-pager --lines=20
-```
-
-If asked to redeploy the latest binary:
-
-```zsh
-just deploy
-```
+| Recipe | When to use |
+|---|---|
+| `just check` | Before committing: fmt, clippy, tests |
+| `just smoke` | After a build: sanity-check the binary |
+| `just restart` | Restart the running service |
+| `just deploy` | Build, install, and restart |
 
 Do not use `sudo` from an agent session — ask the user to run elevated commands in a separate terminal.
 
