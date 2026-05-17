@@ -1,7 +1,5 @@
 # AGENTS.md — toll
 
-Project-specific guidance for toll.
-
 **Read [`DESIGN.md`](DESIGN.md) before any non-trivial change.** It holds the philosophy, architecture, and load-bearing invariants. This file is the operational contract (how to work the repo safely); `DESIGN.md` explains *why* the code is shaped the way it is. If a change fights an invariant in `DESIGN.md`, the change is wrong until that document is deliberately revised.
 
 ## Repo at a glance
