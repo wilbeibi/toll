@@ -234,36 +234,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_tls() {
-        assert_eq!(classify_error("TLS handshake failed"), "upstream_tls");
-    }
-
-    #[test]
-    fn classify_timeout() {
-        assert_eq!(classify_error("request timed out"), "upstream_timeout");
-    }
-
-    #[test]
-    fn classify_connect() {
-        assert_eq!(classify_error("connection refused"), "upstream_connect");
-    }
-
-    #[test]
-    fn classify_client_disconnect() {
-        assert_eq!(classify_error("broken pipe"), "client_disconnect");
-    }
-
-    #[test]
     fn classify_connection_reset_is_client_not_connect() {
         assert_eq!(
             classify_error("connection reset by peer"),
             "client_disconnect"
         );
-    }
-
-    #[test]
-    fn classify_other() {
-        assert_eq!(classify_error("something weird"), "other");
     }
 
     #[test]

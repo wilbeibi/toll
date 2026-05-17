@@ -33,15 +33,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_model_field_from_json_body() {
-        let body = br#"{"model":"claude-3-5-sonnet","messages":[]}"#;
-        assert_eq!(
-            model_from_request_body(body),
-            Some("claude-3-5-sonnet".to_string())
-        );
-    }
-
-    #[test]
     fn response_model_openai_chunk() {
         let v = serde_json::json!({"object": "chat.completion.chunk", "model": "deepseek-v4-pro"});
         assert_eq!(

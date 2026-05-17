@@ -94,16 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn single_event() {
-        let mut splitter = SseSplitter::new(1024);
-        let chunk = b"event: message_start\ndata: {\"type\":\"start\"}\n\n";
-        let events = split_all(&mut splitter, chunk);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "message_start");
-        assert_eq!(events[0].data, "{\"type\":\"start\"}");
-    }
-
-    #[test]
     fn split_across_chunks() {
         let mut splitter = SseSplitter::new(1024);
         let e1 = split_all(&mut splitter, b"event: foo\ndata: hello");

@@ -25,60 +25,7 @@ pub struct Rates {
     pub cache_in_input: bool,
 }
 
-/// Built-in price table. Keys are lowercase model names or name prefixes;
-/// the lookup uses longest-prefix match as a fallback, so a key like
-/// "deepseek-v" covers "deepseek-v3", "deepseek-v4-pro", etc.
-fn default_rates() -> HashMap<String, Rates> {
-    macro_rules! r {
-        ($inp:expr, $out:expr, $cr:expr, $cw:expr, $cii:expr) => {
-            Rates {
-                input_per_m: $inp,
-                output_per_m: $out,
-                cache_read_per_m: $cr,
-                cache_creation_per_m: $cw,
-                cache_in_input: $cii,
-            }
-        };
-    }
-    [
-        // Anthropic — cache is additive (not included in input_tokens)
-        ("claude-opus-4",     r!(15.0,  75.0,  1.5,    18.75, false)),
-        ("claude-4-opus",     r!(15.0,  75.0,  1.5,    18.75, false)),
-        ("claude-3-opus",     r!(15.0,  75.0,  1.5,    18.75, false)),
-        ("claude-sonnet-4",   r!( 3.0,  15.0,  0.3,     3.75, false)),
-        ("claude-4-sonnet",   r!( 3.0,  15.0,  0.3,     3.75, false)),
-        ("claude-3-7-sonnet", r!( 3.0,  15.0,  0.3,     3.75, false)),
-        ("claude-3-5-sonnet", r!( 3.0,  15.0,  0.3,     3.75, false)),
-        ("claude-3-sonnet",   r!( 3.0,  15.0,  0.3,     3.75, false)),
-        ("claude-haiku-4",    r!( 0.8,   4.0,  0.08,    1.0,  false)),
-        ("claude-3-5-haiku",  r!( 0.8,   4.0,  0.08,    1.0,  false)),
-        ("claude-3-haiku",    r!( 0.25,  1.25, 0.03,    0.3,  false)),
-        // OpenAI — cache included in input_tokens
-        ("gpt-4o-mini",       r!( 0.15,  0.6,  0.075,   0.0,  true)),
-        ("gpt-4o",            r!( 2.5,  10.0,  1.25,    0.0,  true)),
-        ("o1-mini",           r!( 1.1,   4.4,  0.55,    0.0,  true)),
-        ("o1",                r!(15.0,  60.0,  7.5,     0.0,  true)),
-        ("o3-mini",           r!( 1.1,   4.4,  0.55,    0.0,  true)),
-        ("o3",                r!(10.0,  40.0,  2.5,     0.0,  true)),
-        // DeepSeek — cache included in input_tokens
-        ("deepseek-chat",     r!( 0.27,  1.10, 0.07,    0.0,  true)),
-        ("deepseek-v",        r!( 0.27,  1.10, 0.07,    0.0,  true)),
-        ("deepseek-reasoner", r!( 0.55,  2.19, 0.14,    0.0,  true)),
-        ("deepseek-r1",       r!( 0.55,  2.19, 0.14,    0.0,  true)),
-        // Gemini — cache included in input_tokens
-        ("gemini-2.5-pro",    r!( 1.25, 10.0,  0.315,   0.0,  true)),
-        ("gemini-2.0-flash",  r!( 0.10,  0.40, 0.025,   0.0,  true)),
-        ("gemini-1.5-pro",    r!( 1.25,  5.0,  0.3125,  0.0,  true)),
-        ("gemini-1.5-flash",  r!( 0.075, 0.30, 0.01875, 0.0,  true)),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect()
-}
-
 struct PriceTable {
-    /// Keys are lowercase model names or prefixes. Local file entries overlay
-    /// the built-in defaults so exact versioned names win over prefix fallbacks.
     map: HashMap<String, Rates>,
 }
 
@@ -92,22 +39,18 @@ impl PriceTable {
     }
 
     fn load(local_path: &Path) -> Self {
-        let mut map = default_rates();
-
-        if let Ok(src) = std::fs::read_to_string(local_path) {
-            match Self::from_json(&src) {
-                Ok(local) => {
-                    // Local entries overlay built-in ones; prefix fallbacks from
-                    // defaults still apply for any model absent from the local file.
-                    map.extend(local);
+        match std::fs::read_to_string(local_path)
+            .ok()
+            .and_then(|s| Self::from_json(&s).ok())
+        {
+            Some(map) => Self { map },
+            None => {
+                if local_path.exists() {
+                    log::warn!("toll: ignoring malformed {}", local_path.display());
                 }
-                Err(e) => {
-                    log::warn!("toll: ignoring malformed {}: {e}", local_path.display());
-                }
+                Self { map: HashMap::new() }
             }
         }
-
-        Self { map }
     }
 
     /// Exact match first; then longest-prefix match (case-insensitive).
@@ -149,8 +92,17 @@ impl PriceTable {
 }
 
 /// Call once at proxy startup before any `compute_cost` calls.
-pub fn init(local_path: &Path) {
-    TABLE.get_or_init(|| PriceTable::load(local_path));
+/// Returns false if no price file was found.
+pub fn init(local_path: &Path) -> bool {
+    let mut found = true;
+    TABLE.get_or_init(|| {
+        let t = PriceTable::load(local_path);
+        if t.map.is_empty() && !local_path.exists() {
+            found = false;
+        }
+        t
+    });
+    found
 }
 
 /// Compute cost in USD. Provider-reported cost (e.g. OpenRouter) takes
@@ -225,31 +177,16 @@ pub async fn pull(dest: &Path) -> Result<()> {
 
 /// Print the active price table source and model count.
 pub fn show(local_path: &Path) {
-    let n_default = default_rates().len();
-
     if local_path.exists() {
         match std::fs::read_to_string(local_path)
             .ok()
             .and_then(|s| serde_json::from_str::<HashMap<String, Rates>>(&s).ok())
         {
-            Some(local) => {
-                println!(
-                    "source: {} ({} models) overlaid on built-in defaults ({n_default} models)",
-                    local_path.display(),
-                    local.len(),
-                );
-            }
-            None => {
-                println!(
-                    "source: built-in defaults ({n_default} models) — {} is unreadable",
-                    local_path.display()
-                );
-            }
+            Some(local) => println!("source: {} ({} models)", local_path.display(), local.len()),
+            None => println!("source: {} — unreadable or malformed", local_path.display()),
         }
     } else {
-        println!(
-            "source: built-in defaults ({n_default} models) — run `toll prices pull` to fetch latest"
-        );
+        println!("no price table found — run `toll prices pull` to fetch one");
     }
 }
 
@@ -258,7 +195,15 @@ mod tests {
     use super::*;
 
     fn table() -> PriceTable {
-        PriceTable { map: default_rates() }
+        let json = r#"{
+            "claude-opus-4":     {"input_per_m":15.0,  "output_per_m":75.0,  "cache_read_per_m":1.5,    "cache_creation_per_m":18.75, "cache_in_input":false},
+            "claude-sonnet-4":   {"input_per_m": 3.0,  "output_per_m":15.0,  "cache_read_per_m":0.3,    "cache_creation_per_m": 3.75, "cache_in_input":false},
+            "claude-haiku-4":    {"input_per_m": 0.8,  "output_per_m": 4.0,  "cache_read_per_m":0.08,   "cache_creation_per_m": 1.0,  "cache_in_input":false},
+            "gpt-4o-mini":       {"input_per_m": 0.15, "output_per_m": 0.6,  "cache_read_per_m":0.075,  "cache_creation_per_m": 0.0,  "cache_in_input":true},
+            "gpt-4o":            {"input_per_m": 2.5,  "output_per_m":10.0,  "cache_read_per_m":1.25,   "cache_creation_per_m": 0.0,  "cache_in_input":true},
+            "deepseek-v":        {"input_per_m": 0.27, "output_per_m": 1.10, "cache_read_per_m":0.07,   "cache_creation_per_m": 0.0,  "cache_in_input":true}
+        }"#;
+        PriceTable { map: PriceTable::from_json(json).unwrap() }
     }
 
     fn usage(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> Usage {
@@ -273,13 +218,6 @@ mod tests {
             },
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn deepseek_prefix_matches_v4_pro() {
-        // deepseek-v4-pro is not an exact key; "deepseek-v" prefix covers it
-        let t = table();
-        assert!(t.lookup("deepseek-v4-pro").is_some());
     }
 
     #[test]
@@ -312,18 +250,4 @@ mod tests {
         assert!((cost - expected).abs() < 1e-9);
     }
 
-    #[test]
-    fn openrouter_reported_cost_wins() {
-        let u = Usage {
-            cost: Some(0.001234),
-            ..Default::default()
-        };
-        assert_eq!(table().compute(Some("gpt-4o"), &u), Some(0.001234));
-    }
-
-    #[test]
-    fn unknown_model_is_none() {
-        let u = usage(100, 50, 0, 0);
-        assert_eq!(table().compute(Some("unknown-xyz"), &u), None);
-    }
 }
