@@ -1,0 +1,36 @@
+[package]
+name = "toll"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Personal LLM API usage meter — localhost reverse proxy"
+license = "MIT"
+
+[[bin]]
+name = "toll"
+path = "src/main.rs"
+
+[dependencies]
+tokio        = { version = "1", features = ["rt", "macros", "fs", "signal", "net", "sync"] }
+axum         = "0.7"
+reqwest      = { version = "0.12", features = ["stream", "http2", "rustls-tls"], default-features = false }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+clap         = { version = "4", features = ["derive"] }
+jiff         = "0.1"
+bytes        = "1"
+futures-util = "0.3"
+anyhow       = "1"
+getrandom    = "0.2"
+log          = "0.4"
+env_logger   = "0.11"
+rusqlite     = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
