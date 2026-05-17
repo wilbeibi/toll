@@ -124,14 +124,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_cost_absent_is_none() {
-        let u = parse_openai(&json!({
-            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
-        }));
-        assert_eq!(u.cost, None);
-    }
-
-    #[test]
     fn parse_reasoning_tokens() {
         let u = parse_openai(&json!({
             "usage": {

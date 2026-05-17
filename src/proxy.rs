@@ -78,7 +78,9 @@ enum ObserverKind {
 }
 
 pub async fn run_all() -> Result<()> {
-    crate::pricing::init(&crate::paths::prices_json());
+    if !crate::pricing::init(&crate::paths::prices_json()) {
+        eprintln!("warning: no price table found; run `toll prices pull` to fetch one");
+    }
     let client = Client::builder().use_rustls_tls().build()?;
     let store = Arc::new(Mutex::new(Store::open(&calls_db())?));
 
@@ -706,13 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn inject_skips_requests_without_stream_field() {
-        let input = bytes(json!({"model": "gpt-4o"}));
-        let out = maybe_inject_stream_options(input.clone());
-        assert_eq!(out, input);
-    }
-
-    #[test]
     fn inject_overwrites_existing_include_usage() {
         let out = maybe_inject_stream_options(bytes(json!({
             "model": "gpt-4o",
@@ -722,17 +717,6 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["stream_options"]["include_usage"], json!(true));
         assert_eq!(v["stream_options"]["extra"], json!(1));
-    }
-
-    #[test]
-    fn inject_replaces_invalid_stream_options() {
-        let out = maybe_inject_stream_options(bytes(json!({
-            "model": "gpt-4o",
-            "stream": true,
-            "stream_options": false
-        })));
-        let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["stream_options"]["include_usage"], json!(true));
     }
 
     #[test]

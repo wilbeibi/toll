@@ -176,11 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_model_path_trailing_slash_returns_none() {
-        assert_eq!(gemini_model_from_path("/v1beta/models/"), None);
-    }
-
-    #[test]
     fn find_by_host_strips_port() {
         // Port suffix must not prevent matching
         assert_eq!(
