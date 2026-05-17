@@ -3,12 +3,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
-
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-
-static TABLE: OnceLock<PriceTable> = OnceLock::new();
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Rates {
@@ -91,24 +87,10 @@ impl PriceTable {
     }
 }
 
-/// Call once at proxy startup before any `compute_cost` calls.
-/// Returns false if no price file was found.
-pub fn init(local_path: &Path) -> bool {
-    let mut found = true;
-    TABLE.get_or_init(|| {
-        let t = PriceTable::load(local_path);
-        if t.map.is_empty() && !local_path.exists() {
-            found = false;
-        }
-        t
-    });
-    found
-}
-
 /// Compute cost in USD. Provider-reported cost (e.g. OpenRouter) takes
-/// precedence; falls back to the loaded price table by model name.
-pub fn compute_cost(model: Option<&str>, usage: &Usage) -> Option<f64> {
-    TABLE.get()?.compute(model, usage)
+/// precedence; falls back to the price table loaded from `local_path`.
+pub fn compute_cost(local_path: &Path, model: Option<&str>, usage: &Usage) -> Option<f64> {
+    PriceTable::load(local_path).compute(model, usage)
 }
 
 /// Fetch the litellm prices JSON, transform to our format, and write to

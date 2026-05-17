@@ -78,7 +78,7 @@ enum ObserverKind {
 }
 
 pub async fn run_all() -> Result<()> {
-    if !crate::pricing::init(&crate::paths::prices_json()) {
+    if !crate::paths::prices_json().exists() {
         eprintln!("warning: no price table found; run `toll prices pull` to fetch one");
     }
     let client = Client::builder().use_rustls_tls().build()?;
@@ -491,7 +491,7 @@ fn record_from_base(
     error_kind: Option<String>,
     error_message: Option<String>,
 ) -> Record {
-    let cost = pricing::compute_cost(base.model.as_deref(), &usage);
+    let cost = pricing::compute_cost(&crate::paths::prices_json(), base.model.as_deref(), &usage);
     Record {
         id: base.id.clone(),
         ts: base.ts.clone(),
