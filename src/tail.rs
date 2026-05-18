@@ -75,10 +75,7 @@ fn print_row(r: &Row) {
     } else {
         String::new()
     };
-    let cost = r
-        .cost
-        .map(|c| format!(" ${c:.4}"))
-        .unwrap_or_default();
+    let cost = r.cost.map(|c| format!(" ${c:.4}")).unwrap_or_default();
     let err = r
         .error_kind
         .as_deref()

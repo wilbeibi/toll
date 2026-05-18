@@ -45,22 +45,22 @@ fn print_shell(providers: &[&Provider], single_provider: bool) {
 }
 
 fn print_json(providers: &[&Provider]) {
-    let mut entries = Vec::new();
-    for p in providers {
-        let base_url = p
-            .env_template
-            .map(|t| extract_url(t, p.default_port))
-            .unwrap_or_else(|| format!("http://127.0.0.1:{}", p.default_port));
-        entries.push(format!(
-            "    \"{}\": {{\"base_url\": \"{}\"}}",
-            p.name, base_url
-        ));
-    }
-    println!("{{");
-    println!("  \"providers\": {{");
-    println!("{}", entries.join(",\n"));
-    println!("  }}");
-    println!("}}");
+    let map: serde_json::Map<String, serde_json::Value> = providers
+        .iter()
+        .map(|p| {
+            let base_url = p
+                .env_template
+                .map(|t| extract_url(t, p.default_port))
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", p.default_port));
+            (
+                p.name.to_string(),
+                serde_json::json!({"base_url": base_url}),
+            )
+        })
+        .collect();
+    let out = serde_json::to_string_pretty(&serde_json::json!({"providers": map}))
+        .expect("serializing known-valid JSON structure");
+    println!("{out}");
 }
 
 fn extract_url(template: &str, port: u16) -> String {

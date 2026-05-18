@@ -25,6 +25,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     }
 
     let conn = open_db(&path)?;
+    // col is always one of two known literal strings, never user input.
     let col = if opts.by_model {
         "COALESCE(model, 'unknown')"
     } else {

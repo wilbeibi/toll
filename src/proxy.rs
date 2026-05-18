@@ -136,7 +136,7 @@ async fn handle_request(
     let headers = parts.headers;
 
     // Model from path (Gemini) or from body.
-    let model_from_path = provider.model_from_path.and_then(|f| f(path));
+    let model_from_path = (provider.model_from_path)(path);
 
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
@@ -545,10 +545,7 @@ fn spawn_record_write(store: Arc<Mutex<Store>>, record: Record) {
 
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigterm = signal(SignalKind::terminate()).unwrap_or_else(|_| {
-        // Fall back to ctrl_c only if SIGTERM setup fails (shouldn't happen).
-        panic!("failed to install SIGTERM handler")
-    });
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
@@ -649,13 +646,7 @@ fn maybe_inject_stream_options(body: Bytes) -> Bytes {
         Some(Value::Object(so)) => {
             so.insert("include_usage".to_string(), serde_json::json!(true));
         }
-        Some(_) => {
-            obj.insert(
-                "stream_options".to_string(),
-                serde_json::json!({"include_usage": true}),
-            );
-        }
-        None => {
+        _ => {
             obj.insert(
                 "stream_options".to_string(),
                 serde_json::json!({"include_usage": true}),
@@ -663,25 +654,6 @@ fn maybe_inject_stream_options(body: Bytes) -> Bytes {
         }
     }
     serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
-}
-
-/// Spawn a proxy on a caller-supplied listener (for tests).
-#[allow(dead_code)]
-pub async fn serve_on(
-    listener: TcpListener,
-    provider: &'static Provider,
-    store: Arc<Mutex<Store>>,
-) -> tokio::task::JoinHandle<()> {
-    let client = Client::builder().use_rustls_tls().build().unwrap();
-    let state = Arc::new(ProxyState {
-        provider,
-        client,
-        store,
-    });
-    let app = Router::new().fallback(handle_request).with_state(state);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    })
 }
 
 #[cfg(test)]

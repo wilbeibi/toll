@@ -145,6 +145,9 @@ impl Store {
     }
 }
 
+/// Open a read-only connection for stats/tail. Intentionally uses a smaller
+/// pragma set than Store::init — no write-tuning (cache_size, temp_store,
+/// mmap_size) needed for query-only paths.
 pub fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -217,7 +220,9 @@ impl Store {
                         input_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
                         output_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                         cache_read_input_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-                        cache_creation_input_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                        cache_creation_input_tokens: row
+                            .get::<_, Option<i64>>(11)?
+                            .map(|v| v as u64),
                         reasoning_output_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                         error_kind: row.get(13)?,
                         error_message: row.get(14)?,
@@ -310,7 +315,10 @@ mod tests {
         assert_eq!(back.input_tokens, rec.input_tokens);
         assert_eq!(back.output_tokens, rec.output_tokens);
         assert_eq!(back.cache_read_input_tokens, rec.cache_read_input_tokens);
-        assert_eq!(back.cache_creation_input_tokens, rec.cache_creation_input_tokens);
+        assert_eq!(
+            back.cache_creation_input_tokens,
+            rec.cache_creation_input_tokens
+        );
         assert_eq!(back.reasoning_output_tokens, rec.reasoning_output_tokens);
         assert_eq!(back.error_kind, rec.error_kind);
         assert_eq!(back.error_message, rec.error_message);
