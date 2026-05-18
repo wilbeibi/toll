@@ -1,7 +1,6 @@
 use crate::json_usage::JsonUsageExtractor;
 use crate::parsers::{model_from_request_body, model_from_response_value};
 use crate::paths::calls_db;
-use crate::pricing;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
 use crate::record::{classify_error, Record, Store, Usage};
 use crate::sse::SseSplitter;
@@ -491,7 +490,6 @@ fn record_from_base(
     error_kind: Option<String>,
     error_message: Option<String>,
 ) -> Record {
-    let cost = pricing::compute_cost(&crate::paths::prices_json(), base.model.as_deref(), &usage);
     Record {
         id: base.id.clone(),
         ts: base.ts.clone(),
@@ -508,7 +506,7 @@ fn record_from_base(
         reasoning_output_tokens: usage.reasoning_output_tokens,
         error_kind,
         error_message,
-        cost,
+        cost: usage.cost,
     }
 }
 
