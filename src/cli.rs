@@ -12,7 +12,7 @@ pub enum Command {
     /// Start the reverse proxy listeners for all providers.
     Start,
 
-    /// Print usage statistics from calls.jsonl.
+    /// Print usage statistics from the call database.
     Stats {
         /// Group by model instead of provider.
         #[arg(long)]

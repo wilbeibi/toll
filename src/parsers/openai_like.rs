@@ -58,8 +58,7 @@ pub fn parse_openai(body: &Value) -> Usage {
 
 /// OpenAI-compatible SSE: `usage` appears in the final chunk when
 /// `stream_options.include_usage=true`. toll injects that option automatically.
-pub fn merge_openai_sse(event_type: &str, data: &Value, into: &mut Usage) {
-    let _ = event_type;
+pub fn merge_openai_sse(_event_type: &str, data: &Value, into: &mut Usage) {
     if data.get("usage").is_some() {
         into.merge(&parse_openai(data));
     }

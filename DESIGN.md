@@ -139,16 +139,19 @@ Each states the rule, its code locus, and the test that proves it.
    omits it. Any per-provider model rewrite is the violation (see
    "Worked example"). Proof: `extracts_top_level_model_across_chunks`,
    `ignores_nested_or_content_model_strings` (`json_usage.rs`).
-7. **Provider-correct cost.** Cached tokens are a *subset* of input for
-   OpenAI/DeepSeek/Gemini (`TotalTokenSemantics::CacheIncludedInInput`)
-   and *additive* for Anthropic (`CacheAdditiveToInput`); `Usage::total`
-   (`record.rs`) applies the per-provider semantics set in `providers.rs`,
-   so a token is never counted twice. Prefer provider-reported
-   `usage.cost` (parsed in `parsers/openai_like.rs`) over any inferred
-   price. Proof: `usage_total_cache_included_in_input`,
-   `usage_total_cache_additive_to_input`,
-   `usage_total_cache_only_is_unknown_when_cache_is_included`
-   (`record.rs`).
+7. **Provider-correct token semantics.** Two shapes exist across
+   providers: *cache-included* (OpenAI, DeepSeek, Gemini non-thinking —
+   cached tokens are a subset of `input_tokens`, stored in
+   `cache_read_input_tokens` as a breakdown) and *cache-additive*
+   (Anthropic — `cache_read_input_tokens` and
+   `cache_creation_input_tokens` are separate from `input_tokens`).
+   Similarly, reasoning tokens are a *subset* of `output_tokens` for all
+   providers except Gemini thinking models, where `thoughtsTokenCount` is
+   additive to `candidatesTokenCount`; `parse_gemini` (`parsers/gemini.rs`)
+   therefore adds them into `output_tokens` so aggregation is correct.
+   Token fields are stored raw and displayed separately in `stats` — no
+   cross-provider "total" is computed. Prefer provider-reported
+   `usage.cost` (`parsers/openai_like.rs`) over any inferred price.
 8. **SQLite is a write-optimized embedded log.** `Store` (`record.rs`):
    WAL, `synchronous=NORMAL`, `busy_timeout=5000`, one long-lived writer
    behind a `Mutex`. Compaction (`wal_checkpoint(TRUNCATE)` + `optimize`)

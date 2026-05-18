@@ -26,12 +26,14 @@ struct PriceTable {
 }
 
 impl PriceTable {
-    fn from_json(json: &str) -> Result<HashMap<String, Rates>> {
+    fn from_json(json: &str) -> Result<Self> {
         let raw: HashMap<String, Rates> = serde_json::from_str(json)?;
-        Ok(raw
-            .into_iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v))
-            .collect())
+        Ok(Self {
+            map: raw
+                .into_iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                .collect(),
+        })
     }
 
     fn load(local_path: &Path) -> Self {
@@ -39,12 +41,14 @@ impl PriceTable {
             .ok()
             .and_then(|s| Self::from_json(&s).ok())
         {
-            Some(map) => Self { map },
+            Some(table) => table,
             None => {
                 if local_path.exists() {
                     log::warn!("toll: ignoring malformed {}", local_path.display());
                 }
-                Self { map: HashMap::new() }
+                Self {
+                    map: HashMap::new(),
+                }
             }
         }
     }
@@ -103,7 +107,13 @@ pub async fn pull(dest: &Path) -> Result<()> {
     // entry; strip control characters so serde_json can parse it.
     let body: String = body
         .chars()
-        .map(|c| if c.is_ascii_control() && c != '\n' { ' ' } else { c })
+        .map(|c| {
+            if c.is_ascii_control() && c != '\n' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
 
     let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&body)?;
@@ -185,14 +195,18 @@ mod tests {
             "gpt-4o":            {"input_per_m": 2.5,  "output_per_m":10.0,  "cache_read_per_m":1.25,   "cache_creation_per_m": 0.0,  "cache_in_input":true},
             "deepseek-v":        {"input_per_m": 0.27, "output_per_m": 1.10, "cache_read_per_m":0.07,   "cache_creation_per_m": 0.0,  "cache_in_input":true}
         }"#;
-        PriceTable { map: PriceTable::from_json(json).unwrap() }
+        PriceTable::from_json(json).unwrap()
     }
 
     fn usage(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> Usage {
         Usage {
             input_tokens: Some(input),
             output_tokens: Some(output),
-            cache_read_input_tokens: if cache_read > 0 { Some(cache_read) } else { None },
+            cache_read_input_tokens: if cache_read > 0 {
+                Some(cache_read)
+            } else {
+                None
+            },
             cache_creation_input_tokens: if cache_creation > 0 {
                 Some(cache_creation)
             } else {
@@ -231,5 +245,4 @@ mod tests {
             + 50_000.0 / 1e6 * 15.0;
         assert!((cost - expected).abs() < 1e-9);
     }
-
 }

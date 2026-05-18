@@ -18,35 +18,44 @@ impl SseSplitter {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseBufferOverflow> {
         let mut events = Vec::new();
 
-        for &b in chunk {
-            self.buf.push(b);
+        self.buf.extend_from_slice(chunk);
 
-            if let Some((event_len, delimiter_len)) = complete_event(&self.buf) {
-                let event_bytes = &self.buf[..event_len];
-                if let Some(ev) = parse_event(event_bytes) {
-                    events.push(ev);
-                }
-                self.buf.drain(..event_len + delimiter_len);
-                continue;
+        while let Some((event_len, delimiter_len)) = find_event(&self.buf) {
+            if let Some(ev) = parse_event(&self.buf[..event_len]) {
+                events.push(ev);
             }
+            self.buf.drain(..event_len + delimiter_len);
+        }
 
-            if self.buf.len() > self.max_event_bytes {
-                self.buf.clear();
-                return Err(SseBufferOverflow);
-            }
+        if self.buf.len() > self.max_event_bytes {
+            self.buf.clear();
+            return Err(SseBufferOverflow);
         }
 
         Ok(events)
     }
 }
 
-fn complete_event(buf: &[u8]) -> Option<(usize, usize)> {
-    if buf.ends_with(b"\r\n\r\n") {
-        Some((buf.len() - 4, 4))
-    } else if buf.ends_with(b"\n\n") {
-        Some((buf.len() - 2, 2))
-    } else {
-        None
+/// Returns the position and length of the earliest event delimiter (`\n\n` or
+/// `\r\n\r\n`) in `buf`, enabling multiple complete events per chunk.
+fn find_event(buf: &[u8]) -> Option<(usize, usize)> {
+    let rn = (buf.len() >= 4)
+        .then(|| buf.windows(4).position(|w| w == b"\r\n\r\n"))
+        .flatten();
+    let nn = (buf.len() >= 2)
+        .then(|| buf.windows(2).position(|w| w == b"\n\n"))
+        .flatten();
+    match (rn, nn) {
+        (None, None) => None,
+        (Some(p), None) => Some((p, 4)),
+        (None, Some(p)) => Some((p, 2)),
+        (Some(rn_p), Some(nn_p)) => {
+            if nn_p < rn_p {
+                Some((nn_p, 2))
+            } else {
+                Some((rn_p, 4))
+            }
+        }
     }
 }
 
