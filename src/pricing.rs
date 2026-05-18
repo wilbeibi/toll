@@ -21,7 +21,7 @@ pub struct Rates {
     pub cache_in_input: bool,
 }
 
-struct PriceTable {
+pub struct PriceTable {
     map: HashMap<String, Rates>,
 }
 
@@ -36,7 +36,7 @@ impl PriceTable {
         })
     }
 
-    fn load(local_path: &Path) -> Self {
+    pub fn load(local_path: &Path) -> Self {
         match std::fs::read_to_string(local_path)
             .ok()
             .and_then(|s| Self::from_json(&s).ok())
@@ -66,7 +66,7 @@ impl PriceTable {
             .map(|(_, r)| r)
     }
 
-    fn compute(&self, model: Option<&str>, usage: &Usage) -> Option<f64> {
+    pub fn compute(&self, model: Option<&str>, usage: &Usage) -> Option<f64> {
         if let Some(c) = usage.cost {
             return Some(c);
         }
@@ -89,12 +89,6 @@ impl PriceTable {
                 + output / 1_000_000.0 * rates.output_per_m,
         )
     }
-}
-
-/// Compute cost in USD. Provider-reported cost (e.g. OpenRouter) takes
-/// precedence; falls back to the price table loaded from `local_path`.
-pub fn compute_cost(local_path: &Path, model: Option<&str>, usage: &Usage) -> Option<f64> {
-    PriceTable::load(local_path).compute(model, usage)
 }
 
 /// Fetch the litellm prices JSON, transform to our format, and write to
