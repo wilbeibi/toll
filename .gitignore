@@ -1,6 +1,7 @@
 /target
 /dist
 *.swp
+.claude/
 
 
 # Added by cargo
