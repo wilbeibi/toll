@@ -1,8 +1,28 @@
 # toll
 
-A local LLM API usage meter. `toll` runs a reverse proxy on `127.0.0.1` for each supported provider, forwards your requests to the real upstream API unchanged, and records per-call usage, latency, cache hits, status, and errors to SQLite.
+`toll` is a personal usage meter for LLM APIs. It gives you a local, searchable record of what your AI tools are using across OpenAI, Anthropic, Gemini, OpenRouter, DeepSeek, and other providers.
 
-You point your clients at toll instead of the upstream URL. Authentication is unchanged — toll forwards your existing API key.
+Run it on your machine, point your clients at `localhost`, and keep using your normal provider API keys. `toll` forwards each request to the real provider and records the useful parts locally: tokens, cost when reported, latency, cache hits, status, model, and errors.
+
+Use it when you want to know:
+
+- What did I call recently?
+- Which provider or model is using the most tokens or money?
+- Did a failed request reach the provider?
+- Are cache hits actually happening?
+- Which tools are quietly sending traffic to which APIs?
+
+No hosted dashboard, no new API keys, no account to create. `toll` only listens on `127.0.0.1` and stores usage on your machine.
+
+## How It Works
+
+Your client sends requests to toll instead of the provider's base URL. Toll forwards the request upstream, streams the response back, and records what happened locally.
+
+```text
+your client -> http://127.0.0.1:<provider-port> -> provider API
+                         |
+                         +-> local SQLite usage log
+```
 
 ## Supported Providers
 
@@ -20,48 +40,54 @@ You point your clients at toll instead of the upstream URL. Authentication is un
 ## Quick Start
 
 ```zsh
-cargo build --release
-target/release/toll start
+cargo install --path .
+toll start
 ```
 
-In another shell, point a client at toll and make a request:
+This installs `toll` to Cargo's default binary directory, usually `~/.cargo/bin`. Make sure that directory is on your `PATH`.
+
+Leave that running. In another shell, point a client at toll and make a normal request:
 
 ```zsh
 export OPENAI_BASE_URL=http://127.0.0.1:4000/v1
-# ...your existing OPENAI_API_KEY stays as-is
+# Keep your existing OPENAI_API_KEY unchanged.
 ```
 
 Then inspect what you used:
 
 ```zsh
-target/release/toll tail -n 10
-target/release/toll stats
+toll tail -n 10
+toll stats
 ```
 
 ## Configure Clients
 
-Print ready-to-paste shell exports for every provider:
+Print ready-to-paste shell exports:
 
 ```zsh
-target/release/toll config
-target/release/toll config --provider openrouter
-target/release/toll config --format json
+toll config
+toll config --provider openrouter
+toll config --format json
 ```
 
 OpenAI-compatible providers share `OPENAI_BASE_URL`, so set it per-process or per-profile rather than globally if you use more than one.
 
-## Run as a User Service
+## Running Long-Term
+
+The simplest way to try toll is `toll start` in a terminal. For daily use, run the installed binary with your usual user-level process manager.
+
+If you have already set up a user systemd unit named `toll.service`, these commands are useful:
 
 ```zsh
 systemctl --user restart toll.service
 systemctl --user status toll.service --no-pager --lines=20
 ```
 
-Toll only ever binds to `127.0.0.1`.
+Toll is designed to bind only to `127.0.0.1`.
 
 ## Usage Data
 
-Records live at:
+Usage records live at:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
@@ -70,31 +96,11 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
 SQLite WAL sidecar files may appear next to the database while the service is running.
 
 ```zsh
-target/release/toll stats             # totals per provider
-target/release/toll stats --by-model  # totals per model
-target/release/toll tail -n 20        # recent calls
+toll stats             # totals per provider
+toll stats --by-model  # totals per model
+toll tail -n 20        # recent calls
 ```
-
-## Development
-
-```zsh
-cargo fmt --all --check
-cargo test
-cargo build --release
-```
-
-Code map:
-
-- `src/providers.rs` — provider ports, upstream URLs, config snippets.
-- `src/proxy.rs` — reverse proxy request/response handling and record writes.
-- `src/record.rs` — SQLite schema and usage record contract.
-- `src/parsers/` — provider-specific token extraction.
-- `src/stats.rs`, `src/tail.rs` — read-only reporting commands.
-
-The `Record` schema is a compatibility contract. New fields must be optional, forward-migrated, and covered by tests.
-
-See [`DESIGN.md`](DESIGN.md) for the philosophy, architecture, and invariants behind toll — read it before non-trivial changes.
 
 ## Status
 
-`0.1.0`. Single Rust binary; no runtime dependencies beyond the system.
+`0.1.0`. Single Rust binary. Local-first by design. See [`DESIGN.md`](DESIGN.md) for architecture and contribution notes.
