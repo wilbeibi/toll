@@ -54,14 +54,14 @@ pub fn run(opts: StatsOpts) -> Result<()> {
 
     let rows = stmt.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,           // group key
-            r.get::<_, Option<String>>(1)?,   // model (for price lookup)
-            r.get::<_, i64>(2)?,              // input_tokens
-            r.get::<_, i64>(3)?,              // output_tokens
-            r.get::<_, i64>(4)?,              // cache_read
-            r.get::<_, i64>(5)?,              // cache_creation
-            r.get::<_, Option<f64>>(6)?,      // stored cost (provider-reported)
-            r.get::<_, bool>(7)?,             // is_error
+            r.get::<_, String>(0)?,         // group key
+            r.get::<_, Option<String>>(1)?, // model (for price lookup)
+            r.get::<_, i64>(2)?,            // input_tokens
+            r.get::<_, i64>(3)?,            // output_tokens
+            r.get::<_, i64>(4)?,            // cache_read
+            r.get::<_, i64>(5)?,            // cache_creation
+            r.get::<_, Option<f64>>(6)?,    // stored cost (provider-reported)
+            r.get::<_, bool>(7)?,           // is_error
         ))
     })?;
 
@@ -71,9 +71,21 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         let call_cost = stored_cost.unwrap_or_else(|| {
             let usage = Usage {
                 input_tokens: if input > 0 { Some(input as u64) } else { None },
-                output_tokens: if output > 0 { Some(output as u64) } else { None },
-                cache_read_input_tokens: if cache_read > 0 { Some(cache_read as u64) } else { None },
-                cache_creation_input_tokens: if cache_write > 0 { Some(cache_write as u64) } else { None },
+                output_tokens: if output > 0 {
+                    Some(output as u64)
+                } else {
+                    None
+                },
+                cache_read_input_tokens: if cache_read > 0 {
+                    Some(cache_read as u64)
+                } else {
+                    None
+                },
+                cache_creation_input_tokens: if cache_write > 0 {
+                    Some(cache_write as u64)
+                } else {
+                    None
+                },
                 ..Default::default()
             };
             prices.compute(model.as_deref(), &usage).unwrap_or(0.0)
