@@ -1,27 +1,70 @@
 # toll
 
-`toll` is a personal usage meter for LLM APIs. It gives you a local, searchable record of what your AI tools are using across OpenAI, Anthropic, Gemini, OpenRouter, DeepSeek, and other providers.
+**See exactly where your LLM API tokens are going.**
 
-Run it on your machine, point your clients at `localhost`, and keep using your normal provider API keys. `toll` forwards each request to the real provider and records the useful parts locally: tokens, cost when reported, latency, cache hits, status, model, and errors.
+`toll` is a local proxy that records every LLM API call your tools make — model, tokens, cost, latency, cache hits, status, and errors — into a searchable SQLite database.
 
-Use it when you want to know:
+Point your OpenAI, Anthropic, Gemini, OpenRouter, DeepSeek, or Kimi clients at `localhost`, keep using your existing API keys, and inspect usage from your terminal.
 
-- What did I call recently?
-- Which provider or model is using the most tokens or money?
-- Did a failed request reach the provider?
+Use it when you want to answer:
+
+- Which tool spent the most money today?
+- Which model is eating the most tokens?
+- Did a failed request still reach the provider?
 - Are cache hits actually happening?
-- Which tools are quietly sending traffic to which APIs?
+- What did my agent call in the last 10 minutes?
+- Which local tools are quietly sending traffic to which APIs?
 
-No hosted dashboard, no new API keys, no account to create. `toll` only listens on `127.0.0.1` and stores usage on your machine.
-
-## How It Works
-
-Your client sends requests to toll instead of the provider's base URL. Toll forwards the request upstream, streams the response back, and records what happened locally.
+No hosted dashboard. No new account. No new API keys. Usage is stored locally in SQLite.
 
 ```text
 your client -> http://127.0.0.1:<provider-port> -> provider API
                          |
                          +-> local SQLite usage log
+```
+
+## Quick Start
+
+```zsh
+git clone https://github.com/wilbeibi/toll
+cd toll
+cargo install --path .
+toll start
+```
+
+In another shell, print ready-to-paste exports and point your client at toll:
+
+```zsh
+eval $(toll config)                        # all providers
+eval $(toll config --provider openrouter)  # one provider
+```
+
+Then inspect what you used:
+
+```zsh
+toll tail -n 10
+toll stats
+toll stats --by-model
+```
+
+## Example Output
+
+```text
+$ toll tail -n 3
+
+[2026-05-20T10:42:18Z] openai gpt-4.1-mini 200 1243ms tokens=842→119 $0.0003
+[2026-05-20T10:43:01Z] anthropic claude-sonnet-4-5 429 823ms tokens=? ERROR=rate_limit
+[2026-05-20T10:43:22Z] openai gpt-4.1-mini 200 312ms tokens=1205→88 cache_read=980 $0.0001
+```
+
+```text
+$ toll stats --by-model
+
+model                  calls  input    output   cache_read  errors  cost_usd
+---------------------  -----  -------  -------  ----------  ------  ----------
+claude-sonnet-4-5      13     210523   31812    45200       1       1.9200
+gpt-4.1-mini           42     81243    9412     0           0       0.1800
+qwen/qwen3-coder-480b  8      44021    12134    0           0       0.0700
 ```
 
 ## Supported Providers
@@ -37,70 +80,20 @@ your client -> http://127.0.0.1:<provider-port> -> provider API
 | MiniMax | `http://127.0.0.1:4006/v1` | `https://api.minimaxi.com` |
 | GLM | `http://127.0.0.1:4007/api/paas/v4` | `https://open.bigmodel.cn` |
 
-## Quick Start
-
-```zsh
-cargo install --path .
-toll start
-```
-
-This installs `toll` to Cargo's default binary directory, usually `~/.cargo/bin`. Make sure that directory is on your `PATH`.
-
-Leave that running. In another shell, point a client at toll and make a normal request:
-
-```zsh
-export OPENAI_BASE_URL=http://127.0.0.1:4000/v1
-# Keep your existing OPENAI_API_KEY unchanged.
-```
-
-Then inspect what you used:
-
-```zsh
-toll tail -n 10
-toll stats
-```
-
-## Configure Clients
-
-Print ready-to-paste shell exports:
-
-```zsh
-toll config
-toll config --provider openrouter
-toll config --format json
-```
-
-OpenAI-compatible providers share `OPENAI_BASE_URL`, so set it per-process or per-profile rather than globally if you use more than one.
-
-## Running Long-Term
-
-The simplest way to try toll is `toll start` in a terminal. For daily use, run the installed binary with your usual user-level process manager.
-
-If you have already set up a user systemd unit named `toll.service`, these commands are useful:
-
-```zsh
-systemctl --user restart toll.service
-systemctl --user status toll.service --no-pager --lines=20
-```
-
-Toll is designed to bind only to `127.0.0.1`.
-
 ## Usage Data
 
-Usage records live at:
+Records live at:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
 ```
 
-SQLite WAL sidecar files may appear next to the database while the service is running.
+`toll` records usage metadata only — model, tokens, cost, latency, status, and errors. Request and response bodies are not stored.
 
-```zsh
-toll stats             # totals per provider
-toll stats --by-model  # totals per model
-toll tail -n 20        # recent calls
-```
+## Local-First
+
+`toll` binds to `127.0.0.1` by default and stores all data on your machine.
 
 ## Status
 
-`0.1.0`. Single Rust binary. Local-first by design. See [`DESIGN.md`](DESIGN.md) for architecture and contribution notes.
+`0.1.0`. Single Rust binary. See [`DESIGN.md`](DESIGN.md) for architecture and contribution notes.
