@@ -3,8 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-const LITELLM_URL: &str =
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+const BIFROST_URL: &str = "https://getbifrost.ai/datasheet";
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Rates {
@@ -91,11 +90,11 @@ impl PriceTable {
     }
 }
 
-/// Fetch the litellm prices JSON, transform to our format, and write to
+/// Fetch prices from Bifrost, transform to our format, and write to
 /// `dest`. Prints a summary on success.
 pub async fn pull(dest: &Path) -> Result<()> {
-    println!("Fetching {LITELLM_URL} ...");
-    let body = reqwest::get(LITELLM_URL).await?.text().await?;
+    println!("Fetching {BIFROST_URL} ...");
+    let body = reqwest::get(BIFROST_URL).await?.text().await?;
 
     // litellm embeds literal tab characters inside strings in the sample_spec
     // entry; strip control characters so serde_json can parse it.
@@ -135,6 +134,7 @@ pub async fn pull(dest: &Path) -> Result<()> {
         let provider = obj
             .get("litellm_provider")
             .and_then(|v| v.as_str())
+            .or_else(|| obj.get("provider").and_then(|v| v.as_str()))
             .unwrap_or("");
         // Anthropic: input_tokens is non-cached only; cache is additive.
         let cache_in_input = provider != "anthropic";
@@ -149,6 +149,25 @@ pub async fn pull(dest: &Path) -> Result<()> {
                 cache_in_input,
             },
         );
+    }
+
+    // Also index by bare base_model name so model names reported by the API
+    // (e.g. "deepseek-v4-pro") resolve when the key uses a provider prefix
+    // (e.g. "openrouter/deepseek/deepseek-v4-pro"). Never overwrites an
+    // existing exact entry.
+    let aliases: Vec<(String, Rates)> = raw
+        .iter()
+        .filter_map(|(name, val)| {
+            let obj = val.as_object()?;
+            let base = obj.get("base_model")?.as_str()?;
+            if out.contains_key(base) {
+                return None;
+            }
+            Some((base.to_string(), out.get(name)?.clone()))
+        })
+        .collect();
+    for (k, v) in aliases {
+        out.entry(k).or_insert(v);
     }
 
     let n = out.len();

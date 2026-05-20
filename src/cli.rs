@@ -45,7 +45,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum PricesCmd {
-    /// Fetch latest prices from litellm and save to the local data directory.
+    /// Fetch latest prices from Bifrost and save to the local data directory.
     Pull,
     /// Show which price table is active and how many models it covers.
     Show,
