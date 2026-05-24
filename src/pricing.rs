@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-const BIFROST_URL: &str = "https://getbifrost.ai/datasheet";
+const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Rates {
@@ -90,84 +90,61 @@ impl PriceTable {
     }
 }
 
-/// Fetch prices from Bifrost, transform to our format, and write to
+/// Fetch prices from models.dev, transform to our format, and write to
 /// `dest`. Prints a summary on success.
 pub async fn pull(dest: &Path) -> Result<()> {
-    println!("Fetching {BIFROST_URL} ...");
-    let body = reqwest::get(BIFROST_URL).await?.text().await?;
+    println!("Fetching {MODELS_DEV_URL} ...");
+    let body = reqwest::get(MODELS_DEV_URL).await?.text().await?;
 
-    // litellm embeds literal tab characters inside strings in the sample_spec
-    // entry; strip control characters so serde_json can parse it.
-    let body: String = body
-        .chars()
-        .map(|c| {
-            if c.is_ascii_control() && c != '\n' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-
+    // Top-level: { provider_id: { models: { model_id: { cost: { input, output, ... } } } } }
     let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&body)?;
 
     let mut out: HashMap<String, Rates> = HashMap::new();
-    for (name, val) in &raw {
-        let Some(obj) = val.as_object() else { continue };
-        let Some(inp) = obj.get("input_cost_per_token").and_then(|v| v.as_f64()) else {
-            continue;
-        };
-        if inp == 0.0 {
-            continue;
-        }
-        let Some(outp) = obj.get("output_cost_per_token").and_then(|v| v.as_f64()) else {
-            continue;
-        };
-        let cache_read = obj
-            .get("cache_read_input_token_cost")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let cache_creation = obj
-            .get("cache_creation_input_token_cost")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let provider = obj
-            .get("litellm_provider")
-            .and_then(|v| v.as_str())
-            .or_else(|| obj.get("provider").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        // Anthropic: input_tokens is non-cached only; cache is additive.
-        let cache_in_input = provider != "anthropic";
 
-        out.insert(
-            name.clone(),
-            Rates {
-                input_per_m: inp * 1_000_000.0,
-                output_per_m: outp * 1_000_000.0,
-                cache_read_per_m: cache_read * 1_000_000.0,
-                cache_creation_per_m: cache_creation * 1_000_000.0,
+    // Process canonical providers first so their bare model IDs win over
+    // reseller/aggregator re-listings that may carry different prices.
+    let priority = ["anthropic", "openai", "google", "deepseek"];
+    let ordered = priority
+        .iter()
+        .filter_map(|id| raw.get_key_value(*id))
+        .chain(raw.iter().filter(|(id, _)| !priority.contains(&id.as_str())));
+
+    for (provider_id, provider_val) in ordered {
+        let Some(models) = provider_val.get("models").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        // Anthropic native API: input_tokens is non-cached only; cache is additive.
+        // All other providers (including OpenRouter): input_tokens includes cached tokens.
+        let cache_in_input = provider_id != "anthropic";
+        for (model_id, model_val) in models {
+            let Some(cost) = model_val.get("cost").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Some(inp) = cost.get("input").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            let Some(outp) = cost.get("output").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            let cache_read = cost.get("cache_read").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cache_creation = cost.get("cache_write").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            out.entry(model_id.clone()).or_insert(Rates {
+                input_per_m: inp,
+                output_per_m: outp,
+                cache_read_per_m: cache_read,
+                cache_creation_per_m: cache_creation,
                 cache_in_input,
-            },
-        );
+            });
+        }
     }
 
-    // Also index by bare base_model name so model names reported by the API
-    // (e.g. "deepseek-v4-pro") resolve when the key uses a provider prefix
-    // (e.g. "openrouter/deepseek/deepseek-v4-pro"). Never overwrites an
-    // existing exact entry.
-    let aliases: Vec<(String, Rates)> = raw
-        .iter()
-        .filter_map(|(name, val)| {
-            let obj = val.as_object()?;
-            let base = obj.get("base_model")?.as_str()?;
-            if out.contains_key(base) {
-                return None;
-            }
-            Some((base.to_string(), out.get(name)?.clone()))
-        })
-        .collect();
-    for (k, v) in aliases {
-        out.entry(k).or_insert(v);
+    // Bare claude-* keys may be claimed by aggregators that set cache_in_input=true.
+    // Anthropic's additive cache accounting applies to all Claude models regardless
+    // of which listing won the insertion race.
+    for (key, rates) in out.iter_mut() {
+        if key.starts_with("claude-") {
+            rates.cache_in_input = false;
+        }
     }
 
     let n = out.len();
