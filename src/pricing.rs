@@ -107,7 +107,10 @@ pub async fn pull(dest: &Path) -> Result<()> {
     let ordered = priority
         .iter()
         .filter_map(|id| raw.get_key_value(*id))
-        .chain(raw.iter().filter(|(id, _)| !priority.contains(&id.as_str())));
+        .chain(
+            raw.iter()
+                .filter(|(id, _)| !priority.contains(&id.as_str())),
+        );
 
     for (provider_id, provider_val) in ordered {
         let Some(models) = provider_val.get("models").and_then(|v| v.as_object()) else {
@@ -126,8 +129,14 @@ pub async fn pull(dest: &Path) -> Result<()> {
             let Some(outp) = cost.get("output").and_then(|v| v.as_f64()) else {
                 continue;
             };
-            let cache_read = cost.get("cache_read").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let cache_creation = cost.get("cache_write").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cache_read = cost
+                .get("cache_read")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let cache_creation = cost
+                .get("cache_write")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             out.entry(model_id.clone()).or_insert(Rates {
                 input_per_m: inp,
                 output_per_m: outp,
