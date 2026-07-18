@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
                 cli::Format::Shell => config::ConfigFormat::Shell,
                 cli::Format::Fish => config::ConfigFormat::Fish,
                 cli::Format::Json => config::ConfigFormat::Json,
+                cli::Format::Url => config::ConfigFormat::Url,
             },
             provider.as_deref(),
         )?,

@@ -6,7 +6,12 @@ pub enum ConfigFormat {
     Shell,
     Fish,
     Json,
+    Url,
 }
+
+/// Any toll listener routes `<provider>.localhost` by name, so the alias
+/// form needs just one well-known port. 4000 is the canonical choice.
+const ALIAS_PORT: u16 = 4000;
 
 pub fn run(format: ConfigFormat, provider: Option<&str>) -> Result<()> {
     let providers = select_providers(provider)?;
@@ -14,8 +19,30 @@ pub fn run(format: ConfigFormat, provider: Option<&str>) -> Result<()> {
         ConfigFormat::Shell => print_exports(&providers, provider.is_some(), shell_line),
         ConfigFormat::Fish => print_exports(&providers, provider.is_some(), fish_line),
         ConfigFormat::Json => print_json(&providers),
+        ConfigFormat::Url => print_urls(&providers, provider.is_some()),
     }
     Ok(())
+}
+
+/// One bare URL per line for a single provider (pipeable); `name<TAB>url`
+/// rows for the full listing.
+fn print_urls(providers: &[&Provider], single_provider: bool) {
+    for p in providers {
+        if single_provider {
+            println!("{}", alias_url(p));
+        } else {
+            println!("{}\t{}", p.name, alias_url(p));
+        }
+    }
+}
+
+/// The memorable base URL: `http://<name>.localhost:4000<provider path>`.
+fn alias_url(p: &Provider) -> String {
+    let suffix = p
+        .env_template
+        .and_then(|t| t.split_once("{port}").map(|(_, s)| s))
+        .unwrap_or("");
+    format!("http://{}.localhost:{}{}", p.name, ALIAS_PORT, suffix)
 }
 
 fn select_providers(provider: Option<&str>) -> Result<Vec<&'static Provider>> {
@@ -108,5 +135,16 @@ mod tests {
     #[test]
     fn fish_line_rejects_non_export_templates() {
         assert_eq!(fish_line("FOO=bar", 1), None);
+    }
+
+    #[test]
+    fn alias_url_keeps_provider_path_suffix() {
+        let openrouter = PROVIDERS.iter().find(|p| p.name == "openrouter").unwrap();
+        assert_eq!(
+            alias_url(openrouter),
+            "http://openrouter.localhost:4000/api/v1"
+        );
+        let gemini = PROVIDERS.iter().find(|p| p.name == "gemini").unwrap();
+        assert_eq!(alias_url(gemini), "http://gemini.localhost:4000");
     }
 }

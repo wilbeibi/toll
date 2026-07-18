@@ -132,7 +132,6 @@ async fn handle_request(
     State(state): State<Arc<ProxyState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    let provider = state.provider;
     let t0 = Instant::now();
     let ts = Timestamp::now().to_string();
     let call_id = new_call_id();
@@ -142,6 +141,17 @@ async fn handle_request(
     let uri = parts.uri;
     let path = uri.path();
     let headers = parts.headers;
+
+    // `<provider>.localhost` in the Host header routes by name from any toll
+    // port; a plain host keeps the port's provider.
+    let provider = match provider_from_host(&headers, uri.authority().map(|a| a.as_str())) {
+        HostRoute::Named(p) => p,
+        HostRoute::None => state.provider,
+        HostRoute::Unknown(name) => {
+            warn!("toll: unknown provider alias {name:?}.localhost; refusing to forward");
+            return Err(StatusCode::MISDIRECTED_REQUEST);
+        }
+    };
 
     // Model from path (Gemini) or from body.
     let model_from_path = (provider.model_from_path)(path);
@@ -549,6 +559,40 @@ fn record_from_base(
     }
 }
 
+enum HostRoute {
+    Named(&'static Provider),
+    Unknown(String),
+    None,
+}
+
+/// Resolve a `<provider>.localhost[:port]` Host (or h2 `:authority`) to a
+/// provider by name. A `*.localhost` label that matches no provider is a hard
+/// error, never a fallback — falling through to the port's provider would
+/// forward (and leak) one provider's credentials to a different upstream.
+/// Bare `localhost`, `127.0.0.1`, and anything else keep the port's provider.
+fn provider_from_host(headers: &HeaderMap, authority: Option<&str>) -> HostRoute {
+    let raw = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or(authority);
+    let Some(raw) = raw else {
+        return HostRoute::None;
+    };
+    // Strip an optional :port. IPv6 literals ([::1]:4000) fail the suffix
+    // test below regardless of how this split lands on them.
+    let host = raw.split(':').next().unwrap_or(raw).to_ascii_lowercase();
+    let Some(name) = host.strip_suffix(".localhost") else {
+        return HostRoute::None;
+    };
+    if name.is_empty() {
+        return HostRoute::None;
+    }
+    match PROVIDERS.iter().find(|p| p.name == name) {
+        Some(p) => HostRoute::Named(p),
+        None => HostRoute::Unknown(name.to_string()),
+    }
+}
+
 /// Client identity for per-tool attribution: `x-toll-client` when the caller
 /// sets one, else the request `User-Agent`. `HeaderValue::to_str` only
 /// passes visible-ASCII values, so byte truncation cannot split a char.
@@ -782,6 +826,62 @@ mod tests {
             "/v1/models/deepseek-v4-pro",
         ] {
             assert!(!is_inference_endpoint(e), "{e} should be skipped");
+        }
+    }
+
+    fn host_route(host: Option<&str>, authority: Option<&str>) -> HostRoute {
+        let mut h = HeaderMap::new();
+        if let Some(v) = host {
+            h.insert("host", v.parse().unwrap());
+        }
+        provider_from_host(&h, authority)
+    }
+
+    #[test]
+    fn host_alias_routes_by_name_from_any_port() {
+        for host in [
+            "openrouter.localhost:4000",
+            "OpenRouter.LOCALHOST",
+            "openrouter.localhost",
+        ] {
+            match host_route(Some(host), None) {
+                HostRoute::Named(p) => assert_eq!(p.name, "openrouter"),
+                _ => panic!("{host} should route to openrouter"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_hosts_keep_the_port_provider() {
+        for host in [
+            "127.0.0.1:4003",
+            "localhost:4003",
+            "localhost",
+            "[::1]:4000",
+        ] {
+            assert!(matches!(host_route(Some(host), None), HostRoute::None));
+        }
+        assert!(matches!(host_route(None, None), HostRoute::None));
+    }
+
+    #[test]
+    fn unknown_alias_is_refused_not_misrouted() {
+        // api.openrouter.localhost and foo.localhost must never fall through
+        // to the port's provider: that would send credentials to the wrong
+        // upstream.
+        for host in ["foo.localhost:4003", "api.openrouter.localhost"] {
+            assert!(matches!(
+                host_route(Some(host), None),
+                HostRoute::Unknown(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn h2_authority_is_honored_when_host_header_absent() {
+        match host_route(None, Some("deepseek.localhost:4000")) {
+            HostRoute::Named(p) => assert_eq!(p.name, "deepseek"),
+            _ => panic!("authority should route to deepseek"),
         }
     }
 

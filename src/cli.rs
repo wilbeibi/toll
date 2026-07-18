@@ -73,4 +73,6 @@ pub enum Format {
     Shell,
     Fish,
     Json,
+    /// Bare base URLs in the memorable `http://<provider>.localhost:4000` form.
+    Url,
 }

@@ -83,6 +83,12 @@ qwen/qwen3-coder-480b  8      44021    12134    0           0       0.0700
 | GLM | `http://127.0.0.1:4007/api/paas/v4` | `https://open.bigmodel.cn` |
 | xAI | `http://127.0.0.1:4008/v1` | `https://api.x.ai` |
 
+Prefer names over port numbers: every listener also routes by Host, so
+`http://<provider>.localhost:4000<path>` works from any toll port — one port
+to remember, e.g. `http://openrouter.localhost:4000/api/v1`. Print them all
+with `toll config --format url`. A mistyped name (`typo.localhost`) is
+refused with 421 instead of being forwarded to the wrong provider.
+
 ## Usage Data
 
 Records live at:
