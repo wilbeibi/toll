@@ -82,6 +82,7 @@ qwen/qwen3-coder-480b  8      44021    12134    0           0       0.0700
 | MiniMax | `http://127.0.0.1:4006/v1` | `https://api.minimaxi.com` |
 | GLM | `http://127.0.0.1:4007/api/paas/v4` | `https://open.bigmodel.cn` |
 | xAI | `http://127.0.0.1:4008/v1` | `https://api.x.ai` |
+| Groq | `http://127.0.0.1:4009/openai/v1` | `https://api.groq.com` |
 
 Prefer names over port numbers: every listener also routes by Host, so
 `http://<provider>.localhost:4000<path>` works from any toll port — one port
@@ -97,7 +98,9 @@ Records live at:
 ${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
 ```
 
-`toll` records usage metadata only — model, tokens, cost, latency, status, errors, and the calling tool (the request `User-Agent`, or an `x-toll-client` header if your tool sets one). Request and response bodies are not stored.
+`toll` records usage metadata only — model, endpoint path, tokens, cost, latency, status, errors, the calling tool (the request `User-Agent`, or an `x-toll-client` header if your tool sets one), and an `anomaly` marker when toll's own observation was degraded (so missing tokens are never ambiguous). Request and response bodies are not stored.
+
+`toll stats --json` / `toll tail --json` emit machine-readable output with computed costs included — raw SQL over the `cost` column sees only provider-reported costs and will undercount.
 
 ## Local-First
 

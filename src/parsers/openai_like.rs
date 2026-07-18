@@ -13,7 +13,7 @@ pub fn parse_openai(body: &Value) -> Usage {
         .or_else(|| u.get("prompt_tokens"))
         .and_then(|v| v.as_u64());
 
-    let output_tokens = u
+    let mut output_tokens = u
         .get("output_tokens")
         .or_else(|| u.get("completion_tokens"))
         .and_then(|v| v.as_u64());
@@ -45,14 +45,38 @@ pub fn parse_openai(body: &Value) -> Usage {
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_u64());
 
+    // xAI's chat API reports reasoning tokens *additively* (prompt +
+    // completion + reasoning == total), unlike OpenAI/DeepSeek where
+    // reasoning is a subset of completion, and unlike xAI's own Responses
+    // endpoint which is subset-style. The total_tokens signature makes the
+    // fold exact per response, not a per-provider guess.
+    if let (Some(t), Some(i), Some(o), Some(r)) = (
+        u.get("total_tokens").and_then(|v| v.as_u64()),
+        input_tokens,
+        output_tokens,
+        reasoning,
+    ) {
+        if r > 0 && i + o + r == t {
+            output_tokens = Some(o + r);
+        }
+    }
+
+    // OpenRouter reports exact billed USD in `usage.cost`; xAI reports it
+    // in `cost_in_usd_ticks` at 1e10 ticks/USD (verified 2026-07-18 against
+    // models.dev rates on recorded grok-4.5 calls: /1e9 is 10x off).
+    let cost = u.get("cost").and_then(|v| v.as_f64()).or_else(|| {
+        u.get("cost_in_usd_ticks")
+            .and_then(|v| v.as_u64())
+            .map(|t| t as f64 / 1e10)
+    });
+
     Usage {
         input_tokens,
         output_tokens,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: None,
         reasoning_output_tokens: reasoning,
-        // OpenRouter reports the exact billed cost (USD) in `usage.cost`.
-        cost: u.get("cost").and_then(|v| v.as_f64()),
+        cost,
     }
 }
 
@@ -67,6 +91,12 @@ pub fn merge_openai_sse(_event_type: &str, data: &Value, into: &mut Usage) {
     if let Some(resp) = data.get("response") {
         if resp.get("usage").is_some() {
             into.merge(&parse_openai(resp));
+        }
+    }
+    // Groq streams report usage in the final chunk under `x_groq.usage`.
+    if let Some(xg) = data.get("x_groq") {
+        if xg.get("usage").is_some() {
+            into.merge(&parse_openai(xg));
         }
     }
 }
@@ -119,6 +149,50 @@ mod tests {
             }
         }));
         assert_eq!(u.cache_read_input_tokens, Some(25));
+    }
+
+    #[test]
+    fn xai_chat_additive_reasoning_folds_into_output() {
+        // Verbatim shape from a recorded grok-4.5 chat call: 211+1+11 == 223.
+        let u = parse_openai(&json!({
+            "usage": {
+                "prompt_tokens": 211, "completion_tokens": 1, "total_tokens": 223,
+                "prompt_tokens_details": {"cached_tokens": 128},
+                "completion_tokens_details": {"reasoning_tokens": 11},
+                "cost_in_usd_ticks": 2764000_u64
+            }
+        }));
+        assert_eq!(u.output_tokens, Some(12));
+        assert_eq!(u.reasoning_output_tokens, Some(11));
+        assert!((u.cost.unwrap() - 0.0002764).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subset_reasoning_is_not_folded() {
+        // OpenAI/DeepSeek style: total == prompt + completion; reasoning is
+        // a subset of completion. xAI's Responses endpoint matches this too.
+        let u = parse_openai(&json!({
+            "usage": {
+                "prompt_tokens": 211, "completion_tokens": 12, "total_tokens": 223,
+                "completion_tokens_details": {"reasoning_tokens": 11}
+            }
+        }));
+        assert_eq!(u.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn sse_groq_x_groq_usage() {
+        let mut u = Usage::default();
+        merge_openai_sse(
+            "",
+            &json!({
+                "choices": [],
+                "x_groq": {"usage": {"prompt_tokens": 40, "completion_tokens": 7}}
+            }),
+            &mut u,
+        );
+        assert_eq!(u.input_tokens, Some(40));
+        assert_eq!(u.output_tokens, Some(7));
     }
 
     #[test]

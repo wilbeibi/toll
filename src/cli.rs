@@ -30,6 +30,10 @@ pub enum Command {
         /// a date (2026-07-01), or an RFC-3339 instant.
         #[arg(long)]
         since: Option<String>,
+
+        /// Emit a JSON array (computed costs included) instead of a table.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Pretty-print the last N calls.
@@ -41,6 +45,10 @@ pub enum Command {
         /// Only include calls at or after this point (same forms as stats).
         #[arg(long)]
         since: Option<String>,
+
+        /// Emit one JSON object per line (computed cost + source included).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print configuration snippets for pointing clients at toll.

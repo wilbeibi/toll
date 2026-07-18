@@ -55,6 +55,15 @@ pub struct Record {
     /// request `User-Agent`. Stored verbatim (truncated at capture).
     #[serde(default)]
     pub client: Option<String>,
+    /// Request path without query, e.g. `/v1/responses`. Distinguishes
+    /// chat vs responses vs embeddings vs transcriptions per row.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Set when observation was degraded (`sse_overflow`,
+    /// `observation_dropped`): the call succeeded but token fields are
+    /// untrustworthy/absent for a toll-side reason, not a provider one.
+    #[serde(default)]
+    pub anomaly: Option<String>,
 }
 
 pub struct Store {
@@ -108,7 +117,9 @@ impl Store {
                 error_kind                  TEXT,
                 error_message               TEXT,
                 cost                        REAL,
-                client                      TEXT
+                client                      TEXT,
+                endpoint                    TEXT,
+                anomaly                     TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
@@ -117,6 +128,8 @@ impl Store {
         // Forward-migrate databases created before a column existed
         // (invariant 4: new fields are optional, appended, migrated).
         self.add_column("ALTER TABLE calls ADD COLUMN client TEXT")?;
+        self.add_column("ALTER TABLE calls ADD COLUMN endpoint TEXT")?;
+        self.add_column("ALTER TABLE calls ADD COLUMN anomaly TEXT")?;
         Ok(())
     }
 
@@ -138,8 +151,8 @@ impl Store {
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 reasoning_output_tokens,
-                error_kind, error_message, cost, client
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                error_kind, error_message, cost, client, endpoint, anomaly
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 r.id,
                 r.ts,
@@ -158,6 +171,8 @@ impl Store {
                 r.error_message,
                 r.cost,
                 r.client,
+                r.endpoint,
+                r.anomaly,
             ],
         )?;
         Ok(())
@@ -223,7 +238,7 @@ impl Store {
                         input_tokens, output_tokens,
                         cache_read_input_tokens, cache_creation_input_tokens,
                         reasoning_output_tokens,
-                        error_kind, error_message, cost, client
+                        error_kind, error_message, cost, client, endpoint, anomaly
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -247,6 +262,8 @@ impl Store {
                         error_message: row.get(14)?,
                         cost: row.get::<_, Option<f64>>(15)?,
                         client: row.get(16)?,
+                        endpoint: row.get(17)?,
+                        anomaly: row.get(18)?,
                     })
                 },
             )
@@ -315,6 +332,8 @@ mod tests {
             error_message: None,
             cost: Some(0.000375),
             client: Some("test-agent/1.0".into()),
+            endpoint: Some("/v1/chat/completions".into()),
+            anomaly: None,
         }
     }
 
@@ -345,6 +364,8 @@ mod tests {
         assert_eq!(back.error_message, rec.error_message);
         assert_eq!(back.cost, rec.cost);
         assert_eq!(back.client, rec.client);
+        assert_eq!(back.endpoint, rec.endpoint);
+        assert_eq!(back.anomaly, rec.anomaly);
     }
 
     #[test]

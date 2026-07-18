@@ -65,6 +65,12 @@ impl PriceTable {
             .map(|(_, r)| r)
     }
 
+    /// Cache accounting shape for a model: true = cached tokens are a subset
+    /// of input_tokens (OpenAI/DeepSeek style), false = additive (Anthropic).
+    pub fn cache_in_input(&self, model: Option<&str>) -> Option<bool> {
+        self.lookup(model?).map(|r| r.cache_in_input)
+    }
+
     pub fn compute(&self, model: Option<&str>, usage: &Usage) -> Option<f64> {
         if let Some(c) = usage.cost {
             return Some(c);

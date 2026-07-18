@@ -10,6 +10,7 @@ pub struct StatsOpts {
     pub by_client: bool,
     pub by_day: bool,
     pub since: Option<String>,
+    pub json: bool,
 }
 
 struct Agg {
@@ -19,8 +20,12 @@ struct Agg {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    /// Denominator for the cache-hit rate, respecting each model's cache
+    /// accounting shape (subset vs additive; see pricing::cache_in_input).
+    cache_denom: i64,
     errors: i64,
     cost: f64,
+    lats: Vec<i64>,
 }
 
 pub fn run(opts: StatsOpts) -> Result<()> {
@@ -57,7 +62,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
                 COALESCE(cache_read_input_tokens, 0),
                 COALESCE(cache_creation_input_tokens, 0),
                 cost,
-                (error_kind IS NOT NULL OR COALESCE(status, 0) >= 400)
+                (error_kind IS NOT NULL OR COALESCE(status, 0) >= 400),
+                latency_ms
          FROM calls
          WHERE ts >= ?1"
     );
@@ -79,11 +85,12 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             r.get::<_, i64>(5)?,            // cache_creation
             r.get::<_, Option<f64>>(6)?,    // stored cost (provider-reported)
             r.get::<_, bool>(7)?,           // is_error (transport or HTTP >= 400)
+            r.get::<_, i64>(8)?,            // latency_ms
         ))
     })?;
 
     for row in rows.filter_map(|r| r.ok()) {
-        let (grp, model, input, output, cache_read, cache_write, stored_cost, is_error) = row;
+        let (grp, model, input, output, cache_read, cache_write, stored_cost, is_error, lat) = row;
 
         let call_cost = match stored_cost {
             Some(c) => c,
@@ -125,6 +132,14 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             }
         };
 
+        // Subset-style caches (OpenAI/DeepSeek) count hits against input;
+        // additive caches (Anthropic) against input + cache fields.
+        let cache_denom = if prices.cache_in_input(model.as_deref()).unwrap_or(true) {
+            input
+        } else {
+            input + cache_read + cache_write
+        };
+
         let e = groups.entry(grp.clone()).or_insert(Agg {
             key: grp,
             calls: 0,
@@ -132,18 +147,22 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_denom: 0,
             errors: 0,
             cost: 0.0,
+            lats: Vec::new(),
         });
         e.calls += 1;
         e.input += input;
         e.output += output;
         e.cache_read += cache_read;
         e.cache_write += cache_write;
+        e.cache_denom += cache_denom;
         if is_error {
             e.errors += 1;
         }
         e.cost += call_cost;
+        e.lats.push(lat);
     }
 
     if groups.is_empty() {
@@ -151,51 +170,10 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         return Ok(());
     }
 
-    let has_cache_write = groups.values().any(|r| r.cache_write > 0);
-
-    // Client keys are raw User-Agent strings and can be long; group on the
-    // full value, truncate only for display.
-    let shown: Vec<(String, &Agg)> = groups.values().map(|a| (display_key(&a.key), a)).collect();
-
-    let w_key = shown
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(8)
-        .max(key_label.len());
-
-    let mut headers = vec![key_label, "calls", "input", "output", "cache_read"];
-    let mut widths = vec![w_key, 5, 7, 7, 10];
-    if has_cache_write {
-        headers.push("cache_write");
-        widths.push(11);
-    }
-    headers.push("errors");
-    widths.push(6);
-    headers.push("cost_usd");
-    widths.push(10);
-
-    print_row(
-        &headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        &widths,
-    );
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    print_row(&sep, &widths);
-
-    for (key, agg) in &shown {
-        let mut cols = vec![
-            key.clone(),
-            agg.calls.to_string(),
-            agg.input.to_string(),
-            agg.output.to_string(),
-            agg.cache_read.to_string(),
-        ];
-        if has_cache_write {
-            cols.push(agg.cache_write.to_string());
-        }
-        cols.push(agg.errors.to_string());
-        cols.push(format!("{:.4}", agg.cost));
-        print_row(&cols, &widths);
+    if opts.json {
+        print_json(key_label, &mut groups);
+    } else {
+        print_table(key_label, &mut groups);
     }
 
     if unpriced_calls > 0 {
@@ -221,6 +199,124 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     Ok(())
 }
 
+fn print_json(key_label: &str, groups: &mut BTreeMap<String, Agg>) {
+    let rows: Vec<serde_json::Value> = groups
+        .values_mut()
+        .map(|a| {
+            let (p50, p95) = percentiles(&mut a.lats);
+            serde_json::json!({
+                key_label: a.key,
+                "calls": a.calls,
+                "input_tokens": a.input,
+                "output_tokens": a.output,
+                "cache_read_tokens": a.cache_read,
+                "cache_creation_tokens": a.cache_write,
+                "cache_hit_pct": cache_pct(a.cache_read, a.cache_denom),
+                "errors": a.errors,
+                "p50_ms": p50,
+                "p95_ms": p95,
+                "cost_usd": a.cost,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).expect("serializing known-valid JSON")
+    );
+}
+
+fn print_table(key_label: &str, groups: &mut BTreeMap<String, Agg>) {
+    let has_cache_write = groups.values().any(|r| r.cache_write > 0);
+
+    // Client keys are raw User-Agent strings and can be long; group on the
+    // full value, truncate only for display.
+    struct Shown {
+        key: String,
+        cols: Vec<String>,
+    }
+    let mut shown: Vec<Shown> = Vec::new();
+    for a in groups.values_mut() {
+        let (p50, p95) = percentiles(&mut a.lats);
+        let mut cols = vec![
+            a.calls.to_string(),
+            a.input.to_string(),
+            a.output.to_string(),
+            a.cache_read.to_string(),
+        ];
+        if has_cache_write {
+            cols.push(a.cache_write.to_string());
+        }
+        cols.push(
+            cache_pct(a.cache_read, a.cache_denom)
+                .map(|p| format!("{p:.0}%"))
+                .unwrap_or_else(|| "-".into()),
+        );
+        cols.push(a.errors.to_string());
+        cols.push(p50.to_string());
+        cols.push(p95.to_string());
+        cols.push(format!("{:.4}", a.cost));
+        shown.push(Shown {
+            key: display_key(&a.key),
+            cols,
+        });
+    }
+
+    let w_key = shown
+        .iter()
+        .map(|s| s.key.chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(key_label.len());
+
+    let mut headers = vec![key_label, "calls", "input", "output", "cache_read"];
+    let mut widths = vec![w_key, 5, 7, 7, 10];
+    if has_cache_write {
+        headers.push("cache_write");
+        widths.push(11);
+    }
+    headers.push("cache%");
+    widths.push(6);
+    headers.push("errors");
+    widths.push(6);
+    headers.push("p50_ms");
+    widths.push(6);
+    headers.push("p95_ms");
+    widths.push(6);
+    headers.push("cost_usd");
+    widths.push(10);
+
+    print_row(
+        &headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &widths,
+    );
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    print_row(&sep, &widths);
+
+    for s in &shown {
+        let mut cols = vec![s.key.clone()];
+        cols.extend(s.cols.iter().cloned());
+        print_row(&cols, &widths);
+    }
+}
+
+fn cache_pct(cache_read: i64, denom: i64) -> Option<f64> {
+    if denom > 0 && cache_read > 0 {
+        Some(cache_read as f64 * 100.0 / denom as f64)
+    } else {
+        None
+    }
+}
+
+/// (p50, p95) over the group's latencies, nearest-rank. Sorts in place.
+fn percentiles(lats: &mut [i64]) -> (i64, i64) {
+    if lats.is_empty() {
+        return (0, 0);
+    }
+    lats.sort_unstable();
+    let at = |p: usize| lats[(lats.len() * p).div_ceil(100).max(1) - 1];
+    (at(50), at(95))
+}
+
 fn display_key(k: &str) -> String {
     const MAX_CHARS: usize = 48;
     let mut chars = k.chars();
@@ -244,4 +340,24 @@ fn print_row(cols: &[String], widths: &[usize]) {
         .map(|(c, w)| format!("{c:<w$}"))
         .collect();
     println!("{}", parts.join("  "));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentiles_pick_median_and_tail() {
+        let mut lats = vec![100, 200, 300, 400, 1000];
+        assert_eq!(percentiles(&mut lats), (300, 1000));
+        let mut one = vec![42];
+        assert_eq!(percentiles(&mut one), (42, 42));
+    }
+
+    #[test]
+    fn cache_pct_needs_positive_denominator() {
+        assert_eq!(cache_pct(50, 100), Some(50.0));
+        assert_eq!(cache_pct(0, 100), None);
+        assert_eq!(cache_pct(50, 0), None);
+    }
 }

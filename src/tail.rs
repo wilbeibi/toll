@@ -10,6 +10,7 @@ struct Row {
     model: Option<String>,
     status: Option<u16>,
     latency_ms: u64,
+    ttft_ms: Option<u64>,
     input: Option<u64>,
     output: Option<u64>,
     cache_read: Option<u64>,
@@ -17,9 +18,11 @@ struct Row {
     error_kind: Option<String>,
     stored_cost: Option<f64>,
     client: Option<String>,
+    endpoint: Option<String>,
+    anomaly: Option<String>,
 }
 
-pub fn run(n: usize, since: Option<String>) -> Result<()> {
+pub fn run(n: usize, since: Option<String>, json: bool) -> Result<()> {
     let path = calls_db();
     if !path.exists() {
         println!("No records yet at {}", path.display());
@@ -36,10 +39,10 @@ pub fn run(n: usize, since: Option<String>) -> Result<()> {
     };
 
     let mut stmt = conn.prepare(
-        "SELECT ts, provider, model, status, latency_ms,
+        "SELECT ts, provider, model, status, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
-                error_kind, cost, client
+                error_kind, cost, client, endpoint, anomaly
          FROM calls
          WHERE ts >= ?1
          ORDER BY rowid DESC
@@ -54,13 +57,16 @@ pub fn run(n: usize, since: Option<String>) -> Result<()> {
                 model: r.get(2)?,
                 status: r.get(3)?,
                 latency_ms: r.get::<_, i64>(4)? as u64,
-                input: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                output: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-                cache_read: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                cache_creation: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                error_kind: r.get(9)?,
-                stored_cost: r.get(10)?,
-                client: r.get(11)?,
+                ttft_ms: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                input: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                output: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                cache_read: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                cache_creation: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                error_kind: r.get(10)?,
+                stored_cost: r.get(11)?,
+                client: r.get(12)?,
+                endpoint: r.get(13)?,
+                anomaly: r.get(14)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -68,9 +74,53 @@ pub fn run(n: usize, since: Option<String>) -> Result<()> {
 
     rows.reverse(); // oldest first
     for row in &rows {
-        print_row(row, &prices);
+        if json {
+            print_json_line(row, &prices);
+        } else {
+            print_row(row, &prices);
+        }
     }
     Ok(())
+}
+
+/// (cost, source): stored provider-reported cost wins; otherwise computed
+/// from the price table at read time.
+fn cost_of(r: &Row, prices: &PriceTable) -> (Option<f64>, &'static str) {
+    if let Some(c) = r.stored_cost {
+        return (Some(c), "provider");
+    }
+    let usage = Usage {
+        input_tokens: r.input,
+        output_tokens: r.output,
+        cache_read_input_tokens: r.cache_read,
+        cache_creation_input_tokens: r.cache_creation,
+        ..Default::default()
+    };
+    (prices.compute(r.model.as_deref(), &usage), "computed")
+}
+
+/// One JSON object per line (JSONL) — grep/jq friendly for consumers.
+fn print_json_line(r: &Row, prices: &PriceTable) {
+    let (cost, cost_source) = cost_of(r, prices);
+    let obj = serde_json::json!({
+        "ts": r.ts,
+        "provider": r.provider,
+        "model": r.model,
+        "endpoint": r.endpoint,
+        "status": r.status,
+        "latency_ms": r.latency_ms,
+        "ttft_ms": r.ttft_ms,
+        "input_tokens": r.input,
+        "output_tokens": r.output,
+        "cache_read_tokens": r.cache_read,
+        "cache_creation_tokens": r.cache_creation,
+        "cost_usd": cost,
+        "cost_source": cost.map(|_| cost_source),
+        "error_kind": r.error_kind,
+        "anomaly": r.anomaly,
+        "client": r.client,
+    });
+    println!("{obj}");
 }
 
 fn print_row(r: &Row, prices: &PriceTable) {
@@ -90,17 +140,10 @@ fn print_row(r: &Row, prices: &PriceTable) {
     } else {
         String::new()
     };
-    let cost = r.stored_cost.or_else(|| {
-        let usage = Usage {
-            input_tokens: r.input,
-            output_tokens: r.output,
-            cache_read_input_tokens: r.cache_read,
-            cache_creation_input_tokens: r.cache_creation,
-            ..Default::default()
-        };
-        prices.compute(r.model.as_deref(), &usage)
-    });
-    let cost = cost.map(|c| format!(" ${c:.4}")).unwrap_or_default();
+    let cost = cost_of(r, prices)
+        .0
+        .map(|c| format!(" ${c:.4}"))
+        .unwrap_or_default();
     // Transport errors carry error_kind; HTTP-level failures only a status.
     let err = match (r.error_kind.as_deref(), r.status) {
         (Some(k), _) => format!(" ERROR={k}"),
@@ -108,14 +151,19 @@ fn print_row(r: &Row, prices: &PriceTable) {
         (None, Some(s)) if s >= 400 => format!(" ERROR=http_{s}"),
         _ => String::new(),
     };
+    let anomaly = r
+        .anomaly
+        .as_deref()
+        .map(|a| format!(" ANOMALY={a}"))
+        .unwrap_or_default();
     let client = r
         .client
         .as_deref()
         .map(|c| format!(" client={}", short_client(c)))
         .unwrap_or_default();
     println!(
-        "[{}] {} {} {} {}ms tokens={}{}{}{}{}",
-        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, client,
+        "[{}] {} {} {} {}ms tokens={}{}{}{}{}{}",
+        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, anomaly, client,
     );
 }
 

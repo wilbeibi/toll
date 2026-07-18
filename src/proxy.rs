@@ -230,6 +230,8 @@ async fn handle_request(
                     error_message: Some(message),
                     cost: None,
                     client,
+                    endpoint: Some(endpoint.clone()),
+                    anomaly: None,
                 };
                 spawn_record_write(state.store.clone(), rec);
             }
@@ -375,6 +377,9 @@ fn spawn_observer(
     let handle = tokio::spawn(async move {
         let mut usage = Usage::default();
         let mut ttft_ms: Option<u64> = None;
+        // Distinguishes "an SSE event outgrew its cap" from "the tee
+        // channel overflowed"; both zero usage, the anomaly column says why.
+        let mut sse_overflow = false;
         let mut sse_splitter = match &kind {
             ObserverKind::Sse { .. } => Some(SseSplitter::new(MAX_SSE_EVENT_BYTES)),
             ObserverKind::Json { .. } => None,
@@ -402,6 +407,7 @@ fn spawn_observer(
                             let events = match splitter.push(&bytes) {
                                 Ok(events) => events,
                                 Err(_) => {
+                                    sse_overflow = true;
                                     dropped.store(true, Ordering::Relaxed);
                                     continue;
                                 }
@@ -434,15 +440,16 @@ fn spawn_observer(
                     }
                 }
                 ObserveMsg::Finish { elapsed_ms } => {
-                    if dropped.load(Ordering::Relaxed) {
-                        usage = Usage::default();
-                    } else {
+                    let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
+                    if anomaly.is_none() {
                         finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
                             store,
-                            record_from_base(&base, usage, elapsed_ms, ttft_ms, None, None),
+                            record_from_base(
+                                &base, usage, elapsed_ms, ttft_ms, None, None, anomaly,
+                            ),
                         );
                     }
                     return;
@@ -452,9 +459,8 @@ fn spawn_observer(
                     kind: error_kind,
                     message,
                 } => {
-                    if dropped.load(Ordering::Relaxed) {
-                        usage = Usage::default();
-                    } else {
+                    let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
+                    if anomaly.is_none() {
                         finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
@@ -467,15 +473,15 @@ fn spawn_observer(
                                 ttft_ms,
                                 Some(error_kind),
                                 Some(message),
+                                anomaly,
                             ),
                         );
                     }
                     return;
                 }
                 ObserveMsg::ClientDisconnect { elapsed_ms } => {
-                    if dropped.load(Ordering::Relaxed) {
-                        usage = Usage::default();
-                    } else {
+                    let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
+                    if anomaly.is_none() {
                         finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
@@ -488,6 +494,7 @@ fn spawn_observer(
                                 ttft_ms,
                                 Some("client_disconnect".to_string()),
                                 Some("downstream client disconnected".to_string()),
+                                anomaly,
                             ),
                         );
                     }
@@ -497,6 +504,21 @@ fn spawn_observer(
         }
     });
     std::mem::drop(handle);
+}
+
+/// Degraded observation at a terminal arm: partial sums are untrustworthy,
+/// so usage is zeroed — and the row says why instead of leaving NULL tokens
+/// indistinguishable from "provider sent no usage".
+fn terminal_anomaly(sse_overflow: bool, dropped: &AtomicBool, usage: &mut Usage) -> Option<String> {
+    if sse_overflow {
+        *usage = Usage::default();
+        Some("sse_overflow".to_string())
+    } else if dropped.load(Ordering::Relaxed) {
+        *usage = Usage::default();
+        Some("observation_dropped".to_string())
+    } else {
+        None
+    }
 }
 
 /// Terminal-arm JSON finalization: a fully-captured usage object is
@@ -537,6 +559,7 @@ fn record_from_base(
     ttft_ms: Option<u64>,
     error_kind: Option<String>,
     error_message: Option<String>,
+    anomaly: Option<String>,
 ) -> Record {
     Record {
         id: base.id.clone(),
@@ -556,6 +579,8 @@ fn record_from_base(
         error_message,
         cost: usage.cost,
         client: base.client.clone(),
+        endpoint: Some(base.endpoint.clone()),
+        anomaly,
     }
 }
 
@@ -626,6 +651,8 @@ fn is_inference_endpoint(endpoint: &str) -> bool {
         "/embeddings",
         "/messages",       // Anthropic
         "/responses",      // OpenAI Responses API
+        "/transcriptions", // Whisper-style audio (Groq/OpenAI) — billed usage
+        "/translations",   // Whisper-style audio translation
         "generatecontent", // Gemini :generateContent / :streamGenerateContent
     ];
     let e = endpoint.to_ascii_lowercase();
@@ -804,8 +831,10 @@ mod tests {
             "/api/v1/chat/completions", // OpenRouter
             "/v1/completions",
             "/v1/embeddings",
-            "/v1/messages",                              // Anthropic
-            "/v1/responses",                             // OpenAI Responses
+            "/v1/messages",                    // Anthropic
+            "/v1/responses",                   // OpenAI Responses
+            "/openai/v1/audio/transcriptions", // Groq whisper
+            "/v1/audio/translations",
             "/v1beta/models/gemini-2.0:generateContent", // Gemini
             "/v1beta/models/gemini-2.0:streamGenerateContent",
         ] {

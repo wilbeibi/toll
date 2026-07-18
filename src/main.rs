@@ -27,13 +27,15 @@ async fn main() -> anyhow::Result<()> {
             by_client,
             by_day,
             since,
+            json,
         } => stats::run(stats::StatsOpts {
             by_model,
             by_client,
             by_day,
             since,
+            json,
         })?,
-        Command::Tail { n, since } => tail::run(n, since)?,
+        Command::Tail { n, since, json } => tail::run(n, since, json)?,
         Command::Config { format, provider } => config::run(
             match format {
                 cli::Format::Shell => config::ConfigFormat::Shell,

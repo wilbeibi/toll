@@ -142,6 +142,19 @@ pub static PROVIDERS: &[Provider] = &[
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
         inject_stream_options: true,
     },
+    Provider {
+        name: "groq",
+        upstream_url: "https://api.groq.com",
+        default_port: 4009,
+        parse_json: parse_openai,
+        json_usage_key: "usage",
+        merge_sse: merge_openai_sse,
+        model_from_path: no_model_from_path,
+        env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/openai/v1"),
+        // Groq streams already carry usage in the final chunk's `x_groq`
+        // object without being asked; no need to touch the request.
+        inject_stream_options: false,
+    },
 ];
 
 #[cfg(test)]
