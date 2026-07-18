@@ -4,13 +4,15 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigFormat {
     Shell,
+    Fish,
     Json,
 }
 
 pub fn run(format: ConfigFormat, provider: Option<&str>) -> Result<()> {
     let providers = select_providers(provider)?;
     match format {
-        ConfigFormat::Shell => print_shell(&providers, provider.is_some()),
+        ConfigFormat::Shell => print_exports(&providers, provider.is_some(), shell_line),
+        ConfigFormat::Fish => print_exports(&providers, provider.is_some(), fish_line),
         ConfigFormat::Json => print_json(&providers),
     }
     Ok(())
@@ -27,14 +29,20 @@ fn select_providers(provider: Option<&str>) -> Result<Vec<&'static Provider>> {
     }
 }
 
-fn print_shell(providers: &[&Provider], single_provider: bool) {
+fn print_exports(
+    providers: &[&Provider],
+    single_provider: bool,
+    render: fn(&str, u16) -> Option<String>,
+) {
     if !single_provider {
         println!("# Multiple providers share OPENAI_BASE_URL.");
         println!("# For pipeable shell output, use: toll config --provider <name>");
     }
     for p in providers {
         if let Some(tmpl) = p.env_template {
-            let line = tmpl.replace("{port}", &p.default_port.to_string());
+            let Some(line) = render(tmpl, p.default_port) else {
+                continue;
+            };
             if single_provider || p.name == "anthropic" {
                 println!("{line}");
             } else {
@@ -42,6 +50,18 @@ fn print_shell(providers: &[&Provider], single_provider: bool) {
             }
         }
     }
+}
+
+fn shell_line(template: &str, port: u16) -> Option<String> {
+    Some(template.replace("{port}", &port.to_string()))
+}
+
+/// Templates are `export NAME=VALUE`; fish spells that `set -gx NAME VALUE`.
+fn fish_line(template: &str, port: u16) -> Option<String> {
+    let line = template.replace("{port}", &port.to_string());
+    let body = line.strip_prefix("export ")?;
+    let (name, value) = body.split_once('=')?;
+    Some(format!("set -gx {name} {value}"))
 }
 
 fn print_json(providers: &[&Provider]) {
@@ -71,4 +91,22 @@ fn extract_url(template: &str, port: u16) -> String {
         .unwrap_or(template)
         .trim_matches('"');
     value.replace("{port}", &port.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fish_line_translates_export() {
+        assert_eq!(
+            fish_line("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1", 4008).as_deref(),
+            Some("set -gx OPENAI_BASE_URL http://127.0.0.1:4008/v1")
+        );
+    }
+
+    #[test]
+    fn fish_line_rejects_non_export_templates() {
+        assert_eq!(fish_line("FOO=bar", 1), None);
+    }
 }

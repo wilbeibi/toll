@@ -131,6 +131,17 @@ pub static PROVIDERS: &[Provider] = &[
         env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/api/paas/v4"),
         inject_stream_options: true,
     },
+    Provider {
+        name: "xai",
+        upstream_url: "https://api.x.ai",
+        default_port: 4008,
+        parse_json: parse_openai,
+        json_usage_key: "usage",
+        merge_sse: merge_openai_sse,
+        model_from_path: no_model_from_path,
+        env_template: Some("export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"),
+        inject_stream_options: true,
+    },
 ];
 
 #[cfg(test)]

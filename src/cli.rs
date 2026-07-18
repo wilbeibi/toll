@@ -17,6 +17,19 @@ pub enum Command {
         /// Group by model instead of provider.
         #[arg(long)]
         by_model: bool,
+
+        /// Group by calling client (x-toll-client / User-Agent).
+        #[arg(long, conflicts_with = "by_model")]
+        by_client: bool,
+
+        /// Group by calendar day (UTC).
+        #[arg(long, conflicts_with_all = ["by_model", "by_client"])]
+        by_day: bool,
+
+        /// Only include calls at or after this point: 30m, 12h, 7d, today,
+        /// a date (2026-07-01), or an RFC-3339 instant.
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Pretty-print the last N calls.
@@ -24,6 +37,10 @@ pub enum Command {
         /// Number of records to show.
         #[arg(short, long, default_value = "20")]
         n: usize,
+
+        /// Only include calls at or after this point (same forms as stats).
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Print configuration snippets for pointing clients at toll.
@@ -45,7 +62,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum PricesCmd {
-    /// Fetch latest prices from Bifrost and save to the local data directory.
+    /// Fetch latest prices from models.dev and save to the local data directory.
     Pull,
     /// Show which price table is active and how many models it covers.
     Show,
@@ -54,5 +71,6 @@ pub enum PricesCmd {
 #[derive(ValueEnum, Clone)]
 pub enum Format {
     Shell,
+    Fish,
     Json,
 }

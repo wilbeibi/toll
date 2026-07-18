@@ -51,6 +51,10 @@ pub struct Record {
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
     pub cost: Option<f64>,
+    /// Calling tool identity: `x-toll-client` header when set, else the
+    /// request `User-Agent`. Stored verbatim (truncated at capture).
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 pub struct Store {
@@ -103,13 +107,27 @@ impl Store {
                 reasoning_output_tokens     INTEGER,
                 error_kind                  TEXT,
                 error_message               TEXT,
-                cost                        REAL
+                cost                        REAL,
+                client                      TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
             CREATE INDEX IF NOT EXISTS idx_model    ON calls(model);",
         )?;
+        // Forward-migrate databases created before a column existed
+        // (invariant 4: new fields are optional, appended, migrated).
+        self.add_column("ALTER TABLE calls ADD COLUMN client TEXT")?;
         Ok(())
+    }
+
+    /// Apply an ADD COLUMN migration; "duplicate column name" means the
+    /// column already exists and is success, not failure.
+    fn add_column(&self, ddl: &str) -> Result<()> {
+        match self.conn.execute_batch(ddl) {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn insert(&self, r: &Record) -> Result<()> {
@@ -120,8 +138,8 @@ impl Store {
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 reasoning_output_tokens,
-                error_kind, error_message, cost
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                error_kind, error_message, cost, client
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 r.id,
                 r.ts,
@@ -139,6 +157,7 @@ impl Store {
                 r.error_kind,
                 r.error_message,
                 r.cost,
+                r.client,
             ],
         )?;
         Ok(())
@@ -204,7 +223,7 @@ impl Store {
                         input_tokens, output_tokens,
                         cache_read_input_tokens, cache_creation_input_tokens,
                         reasoning_output_tokens,
-                        error_kind, error_message, cost
+                        error_kind, error_message, cost, client
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -227,6 +246,7 @@ impl Store {
                         error_kind: row.get(13)?,
                         error_message: row.get(14)?,
                         cost: row.get::<_, Option<f64>>(15)?,
+                        client: row.get(16)?,
                     })
                 },
             )
@@ -294,6 +314,7 @@ mod tests {
             error_kind: None,
             error_message: None,
             cost: Some(0.000375),
+            client: Some("test-agent/1.0".into()),
         }
     }
 
@@ -323,6 +344,32 @@ mod tests {
         assert_eq!(back.error_kind, rec.error_kind);
         assert_eq!(back.error_message, rec.error_message);
         assert_eq!(back.cost, rec.cost);
+        assert_eq!(back.client, rec.client);
+    }
+
+    #[test]
+    fn migration_adds_client_column_to_pre_client_db() {
+        // A database created by a build that predates the client column
+        // must gain it on open, and init must stay idempotent.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calls (
+                id TEXT PRIMARY KEY, ts TEXT NOT NULL, provider TEXT NOT NULL,
+                model TEXT, status INTEGER, latency_ms INTEGER NOT NULL,
+                ttft_ms INTEGER, stream INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER, output_tokens INTEGER,
+                cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+                reasoning_output_tokens INTEGER, error_kind TEXT,
+                error_message TEXT, cost REAL
+            );",
+        )
+        .unwrap();
+        let store = Store { conn };
+        store.init().unwrap();
+        store.init().unwrap();
+        store.insert(&sample_record("migrated")).unwrap();
+        let back = store.get_by_id("migrated").unwrap();
+        assert_eq!(back.client.as_deref(), Some("test-agent/1.0"));
     }
 
     #[test]

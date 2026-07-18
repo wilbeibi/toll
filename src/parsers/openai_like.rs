@@ -58,9 +58,16 @@ pub fn parse_openai(body: &Value) -> Usage {
 
 /// OpenAI-compatible SSE: `usage` appears in the final chunk when
 /// `stream_options.include_usage=true`. toll injects that option automatically.
+/// Responses API streams (xAI, OpenAI /v1/responses) instead nest the final
+/// usage inside the `response.completed` event's response object.
 pub fn merge_openai_sse(_event_type: &str, data: &Value, into: &mut Usage) {
     if data.get("usage").is_some() {
         into.merge(&parse_openai(data));
+    }
+    if let Some(resp) = data.get("response") {
+        if resp.get("usage").is_some() {
+            into.merge(&parse_openai(resp));
+        }
     }
 }
 
@@ -112,6 +119,29 @@ mod tests {
             }
         }));
         assert_eq!(u.cache_read_input_tokens, Some(25));
+    }
+
+    #[test]
+    fn sse_responses_api_completed_event() {
+        let mut u = Usage::default();
+        merge_openai_sse(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "model": "grok-4.5",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 9,
+                        "output_tokens_details": {"reasoning_tokens": 3}
+                    }
+                }
+            }),
+            &mut u,
+        );
+        assert_eq!(u.input_tokens, Some(100));
+        assert_eq!(u.output_tokens, Some(9));
+        assert_eq!(u.reasoning_output_tokens, Some(3));
     }
 
     #[test]

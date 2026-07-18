@@ -31,7 +31,11 @@ struct ProxyState {
 }
 
 const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
-const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
+/// Responses API streams echo the entire request (instructions, tools) inside
+/// the `response.completed` event, so a single event can approach the size of
+/// the request body itself — far past the old 64 KiB chat-delta ceiling.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_CLIENT_BYTES: usize = 128;
 const BODY_CHANNEL_CAP: usize = 4;
 const OBSERVER_CHANNEL_CAP: usize = 4;
 
@@ -45,6 +49,7 @@ struct RecordBase {
     status: Option<u16>,
     stream: bool,
     started: Instant,
+    client: Option<String>,
 }
 
 enum ObserveMsg {
@@ -137,6 +142,9 @@ async fn handle_request(
     // Model from path (Gemini) or from body.
     let model_from_path = (provider.model_from_path)(path);
 
+    // Attribution is a passive read; the forwarded header set is unchanged.
+    let client = client_from_headers(&headers);
+
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
     let (model_from_body, upstream_body) = if needs_body_read {
@@ -207,6 +215,7 @@ async fn handle_request(
                     error_kind: Some(kind.to_string()),
                     error_message: Some(message),
                     cost: None,
+                    client,
                 };
                 spawn_record_write(state.store.clone(), rec);
             }
@@ -242,6 +251,7 @@ async fn handle_request(
         status: Some(status.as_u16()),
         stream: is_sse,
         started: t0,
+        client,
     };
 
     let observer_kind = if is_sse {
@@ -290,6 +300,13 @@ async fn handle_request(
                     return;
                 }
             };
+
+            // h2 bodies often end with an empty END_STREAM frame. It carries
+            // no bytes, and forwarding it races the client's close-after-full-
+            // body, misclassifying a completed call as client_disconnect.
+            if chunk.is_empty() {
+                continue;
+            }
 
             if !observer_dropped.load(Ordering::Relaxed) {
                 try_observe(
@@ -405,18 +422,8 @@ fn spawn_observer(
                 ObserveMsg::Finish { elapsed_ms } => {
                     if dropped.load(Ordering::Relaxed) {
                         usage = Usage::default();
-                    } else if let ObserverKind::Json { parse, enabled, .. } = kind {
-                        if enabled {
-                            if let Some(extractor) = json_extractor.take() {
-                                if base.model.is_none() {
-                                    base.model = extractor.model().map(String::from);
-                                }
-                                usage = extractor
-                                    .finish_wrapped()
-                                    .map(|v| parse(&v))
-                                    .unwrap_or_default();
-                            }
-                        }
+                    } else {
+                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
@@ -428,11 +435,13 @@ fn spawn_observer(
                 }
                 ObserveMsg::UpstreamError {
                     elapsed_ms,
-                    kind,
+                    kind: error_kind,
                     message,
                 } => {
                     if dropped.load(Ordering::Relaxed) {
                         usage = Usage::default();
+                    } else {
+                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
@@ -442,7 +451,7 @@ fn spawn_observer(
                                 usage,
                                 elapsed_ms,
                                 ttft_ms,
-                                Some(kind),
+                                Some(error_kind),
                                 Some(message),
                             ),
                         );
@@ -452,6 +461,8 @@ fn spawn_observer(
                 ObserveMsg::ClientDisconnect { elapsed_ms } => {
                     if dropped.load(Ordering::Relaxed) {
                         usage = Usage::default();
+                    } else {
+                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
                     }
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
@@ -472,6 +483,29 @@ fn spawn_observer(
         }
     });
     std::mem::drop(handle);
+}
+
+/// Terminal-arm JSON finalization: a fully-captured usage object is
+/// all-or-nothing and therefore trustworthy even when the client
+/// disconnected or the upstream failed after the body was observed.
+fn finalize_json_usage(
+    kind: &ObserverKind,
+    json_extractor: &mut Option<JsonUsageExtractor>,
+    base: &mut RecordBase,
+    usage: &mut Usage,
+) {
+    if let ObserverKind::Json { parse, enabled, .. } = kind {
+        if *enabled {
+            if let Some(extractor) = json_extractor.take() {
+                if base.model.is_none() {
+                    base.model = extractor.model().map(String::from);
+                }
+                if let Some(v) = extractor.finish_wrapped() {
+                    *usage = parse(&v);
+                }
+            }
+        }
+    }
 }
 
 fn try_observe(tx: &mpsc::Sender<ObserveMsg>, dropped: &AtomicBool, msg: ObserveMsg) {
@@ -507,7 +541,26 @@ fn record_from_base(
         error_kind,
         error_message,
         cost: usage.cost,
+        client: base.client.clone(),
     }
+}
+
+/// Client identity for per-tool attribution: `x-toll-client` when the caller
+/// sets one, else the request `User-Agent`. `HeaderValue::to_str` only
+/// passes visible-ASCII values, so byte truncation cannot split a char.
+fn client_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-toll-client")
+        .or_else(|| headers.get(header::USER_AGENT))?
+        .to_str()
+        .ok()?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut s = raw.to_string();
+    s.truncate(MAX_CLIENT_BYTES);
+    Some(s)
 }
 
 /// toll records *inference* — requests that consume tokens and cost money.
@@ -726,6 +779,35 @@ mod tests {
         ] {
             assert!(!is_inference_endpoint(e), "{e} should be skipped");
         }
+    }
+
+    #[test]
+    fn client_prefers_toll_header_over_user_agent() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "node".parse().unwrap());
+        h.insert("x-toll-client", "opencode".parse().unwrap());
+        assert_eq!(client_from_headers(&h).as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn client_falls_back_to_user_agent() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "python-requests/2.32".parse().unwrap());
+        assert_eq!(
+            client_from_headers(&h).as_deref(),
+            Some("python-requests/2.32")
+        );
+    }
+
+    #[test]
+    fn client_is_bounded_and_blank_is_none() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "  ".parse().unwrap());
+        assert_eq!(client_from_headers(&h), None);
+        let long = "x".repeat(1000);
+        h.insert("user-agent", long.parse().unwrap());
+        assert_eq!(client_from_headers(&h).unwrap().len(), MAX_CLIENT_BYTES);
+        assert_eq!(client_from_headers(&HeaderMap::new()), None);
     }
 
     #[test]

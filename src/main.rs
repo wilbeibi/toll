@@ -7,6 +7,7 @@ mod pricing;
 mod providers;
 mod proxy;
 mod record;
+mod since;
 mod sse;
 mod stats;
 mod tail;
@@ -21,11 +22,22 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start => proxy::run_all().await?,
-        Command::Stats { by_model } => stats::run(stats::StatsOpts { by_model })?,
-        Command::Tail { n } => tail::run(n)?,
+        Command::Stats {
+            by_model,
+            by_client,
+            by_day,
+            since,
+        } => stats::run(stats::StatsOpts {
+            by_model,
+            by_client,
+            by_day,
+            since,
+        })?,
+        Command::Tail { n, since } => tail::run(n, since)?,
         Command::Config { format, provider } => config::run(
             match format {
                 cli::Format::Shell => config::ConfigFormat::Shell,
+                cli::Format::Fish => config::ConfigFormat::Fish,
                 cli::Format::Json => config::ConfigFormat::Json,
             },
             provider.as_deref(),

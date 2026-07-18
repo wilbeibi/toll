@@ -2,6 +2,7 @@ use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
 use crate::record::{open_db, Usage};
 use anyhow::Result;
+use rusqlite::params;
 
 struct Row {
     ts: String,
@@ -15,9 +16,10 @@ struct Row {
     cache_creation: Option<u64>,
     error_kind: Option<String>,
     stored_cost: Option<f64>,
+    client: Option<String>,
 }
 
-pub fn run(n: usize) -> Result<()> {
+pub fn run(n: usize, since: Option<String>) -> Result<()> {
     let path = calls_db();
     if !path.exists() {
         println!("No records yet at {}", path.display());
@@ -27,18 +29,25 @@ pub fn run(n: usize) -> Result<()> {
     let conn = open_db(&path)?;
     let prices = PriceTable::load(&prices_json());
 
+    // Every stored ts sorts >= "", so the no-filter case binds an empty bound.
+    let lower = match &since {
+        Some(spec) => crate::since::lower_bound(spec)?,
+        None => String::new(),
+    };
+
     let mut stmt = conn.prepare(
         "SELECT ts, provider, model, status, latency_ms,
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
-                error_kind, cost
+                error_kind, cost, client
          FROM calls
+         WHERE ts >= ?1
          ORDER BY rowid DESC
-         LIMIT ?1",
+         LIMIT ?2",
     )?;
 
     let mut rows: Vec<Row> = stmt
-        .query_map([n as i64], |r| {
+        .query_map(params![lower, n as i64], |r| {
             Ok(Row {
                 ts: r.get(0)?,
                 provider: r.get(1)?,
@@ -51,6 +60,7 @@ pub fn run(n: usize) -> Result<()> {
                 cache_creation: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
                 error_kind: r.get(9)?,
                 stored_cost: r.get(10)?,
+                client: r.get(11)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -91,13 +101,26 @@ fn print_row(r: &Row, prices: &PriceTable) {
         prices.compute(r.model.as_deref(), &usage)
     });
     let cost = cost.map(|c| format!(" ${c:.4}")).unwrap_or_default();
-    let err = r
-        .error_kind
+    // Transport errors carry error_kind; HTTP-level failures only a status.
+    let err = match (r.error_kind.as_deref(), r.status) {
+        (Some(k), _) => format!(" ERROR={k}"),
+        (None, Some(429)) => " ERROR=rate_limit".to_string(),
+        (None, Some(s)) if s >= 400 => format!(" ERROR=http_{s}"),
+        _ => String::new(),
+    };
+    let client = r
+        .client
         .as_deref()
-        .map(|k| format!(" ERROR={k}"))
+        .map(|c| format!(" client={}", short_client(c)))
         .unwrap_or_default();
     println!(
-        "[{}] {} {} {} {}ms tokens={}{}{}{}",
-        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err,
+        "[{}] {} {} {} {}ms tokens={}{}{}{}{}",
+        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, client,
     );
+}
+
+/// First whitespace token of the raw client, bounded for one-line display.
+fn short_client(c: &str) -> String {
+    let tok = c.split_whitespace().next().unwrap_or(c);
+    tok.chars().take(40).collect()
 }

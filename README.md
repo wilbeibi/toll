@@ -42,9 +42,11 @@ eval $(toll config --provider openrouter)  # one provider
 Then inspect what you used:
 
 ```zsh
-toll tail -n 10
-toll stats
+toll tail -n 10 --since 2h
+toll stats --since 7d
 toll stats --by-model
+toll stats --by-client     # which tool spent it (User-Agent / x-toll-client)
+toll stats --by-day        # daily trend
 ```
 
 ## Example Output
@@ -79,6 +81,7 @@ qwen/qwen3-coder-480b  8      44021    12134    0           0       0.0700
 | Kimi | `http://127.0.0.1:4005/v1` | `https://api.moonshot.ai` |
 | MiniMax | `http://127.0.0.1:4006/v1` | `https://api.minimaxi.com` |
 | GLM | `http://127.0.0.1:4007/api/paas/v4` | `https://open.bigmodel.cn` |
+| xAI | `http://127.0.0.1:4008/v1` | `https://api.x.ai` |
 
 ## Usage Data
 
@@ -88,7 +91,7 @@ Records live at:
 ${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
 ```
 
-`toll` records usage metadata only — model, tokens, cost, latency, status, and errors. Request and response bodies are not stored.
+`toll` records usage metadata only — model, tokens, cost, latency, status, errors, and the calling tool (the request `User-Agent`, or an `x-toll-client` header if your tool sets one). Request and response bodies are not stored.
 
 ## Local-First
 

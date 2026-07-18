@@ -344,6 +344,18 @@ mod tests {
     }
 
     #[test]
+    fn extracts_xai_chat_usage_with_nested_details() {
+        // Verbatim xAI grok-4.5 chat.completion body captured 2026-07-18.
+        let body = r#"{"id":"3e8ac002-e9a3-9a46-a13c-ac8c18acdf01","object":"chat.completion","created":1784398415,"model":"grok-4.5","choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"The user wants me to reply with just \"ok\".","refusal":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":211,"completion_tokens":1,"total_tokens":223,"prompt_tokens_details":{"text_tokens":211,"audio_tokens":0,"image_tokens":0,"cached_tokens":128},"completion_tokens_details":{"reasoning_tokens":11,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"num_sources_used":0,"cost_in_usd_ticks":2764000},"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}"#;
+        let mut ex = JsonUsageExtractor::new("usage");
+        ex.push(body.as_bytes());
+        assert_eq!(ex.model(), Some("grok-4.5"));
+        let wrapped = ex.finish_wrapped().unwrap();
+        assert_eq!(wrapped["usage"]["prompt_tokens"], 211);
+        assert_eq!(wrapped["usage"]["completion_tokens"], 1);
+    }
+
+    #[test]
     fn oversized_model_does_not_block_usage_extraction() {
         let mut ex = JsonUsageExtractor::new("usage");
         let body = format!(
