@@ -37,7 +37,11 @@ const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_CLIENT_BYTES: usize = 128;
 const BODY_CHANNEL_CAP: usize = 4;
-const OBSERVER_CHANNEL_CAP: usize = 4;
+/// Must absorb one MAX_SSE_EVENT_BYTES event arriving as ~16 KiB h2 frames
+/// while the observer is busy serde-parsing a previous request-echoing event
+/// (Responses API `response.created` bodies); otherwise the tee drops and
+/// zeroes usage on exactly the largest — most expensive — calls.
+const OBSERVER_CHANNEL_CAP: usize = 64;
 
 #[derive(Clone)]
 struct RecordBase {
