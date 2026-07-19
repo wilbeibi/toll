@@ -18,6 +18,52 @@ pub struct Rates {
     /// is non-cached only and cache is reported additively.
     #[serde(default)]
     pub cache_in_input: bool,
+    /// Context-length pricing tiers (e.g. Gemini/Grok/Claude bill a higher
+    /// rate once the prompt exceeds a threshold). When a request's input
+    /// context exceeds a tier's `above_input_tokens`, that tier's rates
+    /// replace the base rates for the *whole* request — providers reprice the
+    /// entire call, not just the overflow. Empty for flat-priced models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<Tier>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct Tier {
+    /// Applies when the request's input context exceeds this many tokens.
+    pub above_input_tokens: u64,
+    pub input_per_m: f64,
+    pub output_per_m: f64,
+    #[serde(default)]
+    pub cache_read_per_m: f64,
+    #[serde(default)]
+    pub cache_creation_per_m: f64,
+}
+
+impl Rates {
+    /// Per-million (input, output, cache_read, cache_creation) rates for a
+    /// request whose input context is `context_tokens`. Selects the highest
+    /// context tier the request exceeds, falling back to the base rates when
+    /// no tier applies. Robust to tier ordering.
+    fn effective_rates(&self, context_tokens: u64) -> (f64, f64, f64, f64) {
+        self.tiers
+            .iter()
+            .filter(|t| context_tokens > t.above_input_tokens)
+            .max_by_key(|t| t.above_input_tokens)
+            .map(|t| {
+                (
+                    t.input_per_m,
+                    t.output_per_m,
+                    t.cache_read_per_m,
+                    t.cache_creation_per_m,
+                )
+            })
+            .unwrap_or((
+                self.input_per_m,
+                self.output_per_m,
+                self.cache_read_per_m,
+                self.cache_creation_per_m,
+            ))
+    }
 }
 
 pub struct PriceTable {
@@ -81,6 +127,18 @@ impl PriceTable {
         let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
         let output = usage.output_tokens.unwrap_or(0) as f64;
 
+        // Context tiers threshold on total prompt size. For additive-cache
+        // providers (Anthropic) input_tokens excludes cache, so add it back to
+        // size the context; for cache-included providers input_tokens already
+        // counts it.
+        let context_tokens = if rates.cache_in_input {
+            input
+        } else {
+            input + cache_read + cache_creation
+        };
+        let (input_per_m, output_per_m, cache_read_per_m, cache_creation_per_m) =
+            rates.effective_rates(context_tokens);
+
         let non_cached_input = if rates.cache_in_input {
             input.saturating_sub(cache_read) as f64
         } else {
@@ -88,10 +146,10 @@ impl PriceTable {
         };
 
         Some(
-            non_cached_input / 1_000_000.0 * rates.input_per_m
-                + cache_read as f64 / 1_000_000.0 * rates.cache_read_per_m
-                + cache_creation as f64 / 1_000_000.0 * rates.cache_creation_per_m
-                + output / 1_000_000.0 * rates.output_per_m,
+            non_cached_input / 1_000_000.0 * input_per_m
+                + cache_read as f64 / 1_000_000.0 * cache_read_per_m
+                + cache_creation as f64 / 1_000_000.0 * cache_creation_per_m
+                + output / 1_000_000.0 * output_per_m,
         )
     }
 }
@@ -143,12 +201,51 @@ pub async fn pull(dest: &Path) -> Result<()> {
                 .get("cache_write")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
+            // Context-length tiers: models.dev lists them under `cost.tiers` as
+            // `{input, output, cache_read, tier:{type:"context", size}}`. A tier
+            // field it omits inherits the base rate. (`context_over_200k` is a
+            // redundant convenience copy of the same data — ignored.)
+            let tiers = cost
+                .get("tiers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let mut ts: Vec<Tier> = arr
+                        .iter()
+                        .filter_map(|t| {
+                            let info = t.get("tier")?;
+                            if info.get("type").and_then(|v| v.as_str()) != Some("context") {
+                                return None;
+                            }
+                            let above = info.get("size").and_then(|v| v.as_u64())?;
+                            Some(Tier {
+                                above_input_tokens: above,
+                                input_per_m: t.get("input").and_then(|v| v.as_f64()).unwrap_or(inp),
+                                output_per_m: t
+                                    .get("output")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(outp),
+                                cache_read_per_m: t
+                                    .get("cache_read")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(cache_read),
+                                cache_creation_per_m: t
+                                    .get("cache_write")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(cache_creation),
+                            })
+                        })
+                        .collect();
+                    ts.sort_by_key(|t| t.above_input_tokens);
+                    ts
+                })
+                .unwrap_or_default();
             out.entry(model_id.clone()).or_insert(Rates {
                 input_per_m: inp,
                 output_per_m: outp,
                 cache_read_per_m: cache_read,
                 cache_creation_per_m: cache_creation,
                 cache_in_input,
+                tiers,
             });
         }
     }
@@ -248,6 +345,36 @@ mod tests {
             + 20_000.0 / 1e6 * 0.3
             + 5_000.0 / 1e6 * 3.75
             + 50_000.0 / 1e6 * 15.0;
+        assert!((cost - expected).abs() < 1e-9);
+    }
+
+    fn tiered_table() -> PriceTable {
+        // grok-style context tier: base below 200k, double above (verbatim
+        // models.dev shape for xai grok, transformed by `pull`).
+        let json = r#"{
+            "grok-4.3": {"input_per_m":1.25,"output_per_m":2.5,"cache_read_per_m":0.2,
+                "cache_creation_per_m":0.0,"cache_in_input":true,
+                "tiers":[{"above_input_tokens":200000,"input_per_m":2.5,"output_per_m":5.0,
+                          "cache_read_per_m":0.4,"cache_creation_per_m":0.0}]}
+        }"#;
+        PriceTable::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn context_tier_below_threshold_uses_base_rates() {
+        let u = usage(100_000, 1_000, 0, 0);
+        let cost = tiered_table().compute(Some("grok-4.3"), &u).unwrap();
+        let expected = 100_000.0 / 1e6 * 1.25 + 1_000.0 / 1e6 * 2.5;
+        assert!((cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn context_tier_above_threshold_reprices_whole_request() {
+        // 250k input > 200k: the entire request bills at the tier rate, not
+        // just the 50k overflow. This is the bug the flat table mispriced.
+        let u = usage(250_000, 1_000, 0, 0);
+        let cost = tiered_table().compute(Some("grok-4.3"), &u).unwrap();
+        let expected = 250_000.0 / 1e6 * 2.5 + 1_000.0 / 1e6 * 5.0;
         assert!((cost - expected).abs() < 1e-9);
     }
 }

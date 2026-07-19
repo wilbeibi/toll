@@ -1,5 +1,5 @@
 use crate::json_usage::JsonUsageExtractor;
-use crate::parsers::{model_from_request_body, model_from_response_value};
+use crate::parsers::{model_from_request_body, model_from_response_value, raw_usage_value};
 use crate::paths::calls_db;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
 use crate::record::{classify_error, Record, Store, Usage};
@@ -36,6 +36,11 @@ const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
 /// the request body itself — far past the old 64 KiB chat-delta ceiling.
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_CLIENT_BYTES: usize = 128;
+/// Cap on verbatim usage sub-objects retained for the `raw_usage` audit
+/// column. Providers send one (OpenAI/Gemini) or two (Anthropic
+/// `message_start` + `message_delta`); the cap only guards against a
+/// pathological stream repeating usage-shaped events.
+const MAX_RAW_USAGE_OBJS: usize = 8;
 const BODY_CHANNEL_CAP: usize = 4;
 /// Must absorb one MAX_SSE_EVENT_BYTES event arriving as ~16 KiB h2 frames
 /// while the observer is busy serde-parsing a previous request-echoing event
@@ -232,6 +237,7 @@ async fn handle_request(
                     client,
                     endpoint: Some(endpoint.clone()),
                     anomaly: None,
+                    raw_usage: None,
                 };
                 spawn_record_write(state.store.clone(), rec);
             }
@@ -377,6 +383,8 @@ fn spawn_observer(
     let handle = tokio::spawn(async move {
         let mut usage = Usage::default();
         let mut ttft_ms: Option<u64> = None;
+        // Verbatim usage sub-objects, retained for the `raw_usage` audit column.
+        let mut raw_usage_objs: Vec<Value> = Vec::new();
         // Distinguishes "an SSE event outgrew its cap" from "the tee
         // channel overflowed"; both zero usage, the anomaly column says why.
         let mut sse_overflow = false;
@@ -426,6 +434,11 @@ fn spawn_observer(
                                             base.model = model_from_response_value(&data);
                                         }
                                         merge(&event.event_type, &data, &mut usage);
+                                        if raw_usage_objs.len() < MAX_RAW_USAGE_OBJS {
+                                            if let Some(u) = raw_usage_value(&data) {
+                                                raw_usage_objs.push(u);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -440,15 +453,38 @@ fn spawn_observer(
                     }
                 }
                 ObserveMsg::Finish { elapsed_ms } => {
-                    let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
+                    let mut anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
+                    // `sse_overflow`/`observation_dropped` mean the capture was
+                    // degraded; `no_usage` (added below) does not — its raw
+                    // object is worth keeping precisely because it went
+                    // unparsed.
+                    let degraded = anomaly.is_some();
                     if anomaly.is_none() {
-                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
+                        finalize_json_usage(
+                            &kind,
+                            &mut json_extractor,
+                            &mut base,
+                            &mut usage,
+                            &mut raw_usage_objs,
+                        );
                     }
+                    // Canary: a successful inference that captured no usage at
+                    // all is a silent metering miss (unknown provider shape,
+                    // non-SSE stream, usage withheld) — flag it so it is
+                    // distinguishable from a genuine zero-token call.
+                    if anomaly.is_none()
+                        && is_success(base.status)
+                        && is_inference_endpoint(&base.endpoint)
+                        && usage_is_empty(&usage)
+                    {
+                        anomaly = Some("no_usage".to_string());
+                    }
+                    let raw_usage = raw_usage_json(&raw_usage_objs, !degraded);
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
                             store,
                             record_from_base(
-                                &base, usage, elapsed_ms, ttft_ms, None, None, anomaly,
+                                &base, usage, elapsed_ms, ttft_ms, None, None, anomaly, raw_usage,
                             ),
                         );
                     }
@@ -461,8 +497,15 @@ fn spawn_observer(
                 } => {
                     let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
                     if anomaly.is_none() {
-                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
+                        finalize_json_usage(
+                            &kind,
+                            &mut json_extractor,
+                            &mut base,
+                            &mut usage,
+                            &mut raw_usage_objs,
+                        );
                     }
+                    let raw_usage = raw_usage_json(&raw_usage_objs, anomaly.is_none());
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
                             store,
@@ -474,6 +517,7 @@ fn spawn_observer(
                                 Some(error_kind),
                                 Some(message),
                                 anomaly,
+                                raw_usage,
                             ),
                         );
                     }
@@ -482,8 +526,15 @@ fn spawn_observer(
                 ObserveMsg::ClientDisconnect { elapsed_ms } => {
                     let anomaly = terminal_anomaly(sse_overflow, &dropped, &mut usage);
                     if anomaly.is_none() {
-                        finalize_json_usage(&kind, &mut json_extractor, &mut base, &mut usage);
+                        finalize_json_usage(
+                            &kind,
+                            &mut json_extractor,
+                            &mut base,
+                            &mut usage,
+                            &mut raw_usage_objs,
+                        );
                     }
+                    let raw_usage = raw_usage_json(&raw_usage_objs, anomaly.is_none());
                     if is_inference_endpoint(&base.endpoint) {
                         spawn_record_write(
                             store,
@@ -495,6 +546,7 @@ fn spawn_observer(
                                 Some("client_disconnect".to_string()),
                                 Some("downstream client disconnected".to_string()),
                                 anomaly,
+                                raw_usage,
                             ),
                         );
                     }
@@ -529,6 +581,7 @@ fn finalize_json_usage(
     json_extractor: &mut Option<JsonUsageExtractor>,
     base: &mut RecordBase,
     usage: &mut Usage,
+    raw_usage_objs: &mut Vec<Value>,
 ) {
     if let ObserverKind::Json { parse, enabled, .. } = kind {
         if *enabled {
@@ -537,11 +590,44 @@ fn finalize_json_usage(
                     base.model = extractor.model().map(String::from);
                 }
                 if let Some(v) = extractor.finish_wrapped() {
+                    // `finish_wrapped` returns `{usage_key: <usage>}`; store the
+                    // inner object verbatim for `raw_usage`.
+                    if let Some(inner) = v.as_object().and_then(|m| m.values().next()) {
+                        raw_usage_objs.push(inner.clone());
+                    }
                     *usage = parse(&v);
                 }
             }
         }
     }
+}
+
+/// Serialize retained usage sub-objects for the `raw_usage` column. Returns
+/// `None` when `trustworthy` is false (a degraded/anomalous observation) or
+/// nothing was captured. A single object stays an object; usage split across
+/// events (Anthropic) becomes a JSON array.
+fn raw_usage_json(objs: &[Value], trustworthy: bool) -> Option<String> {
+    if !trustworthy {
+        return None;
+    }
+    match objs {
+        [] => None,
+        [one] => serde_json::to_string(one).ok(),
+        many => serde_json::to_string(&Value::Array(many.to_vec())).ok(),
+    }
+}
+
+fn is_success(status: Option<u16>) -> bool {
+    matches!(status, Some(s) if (200..300).contains(&s))
+}
+
+fn usage_is_empty(u: &Usage) -> bool {
+    u.input_tokens.is_none()
+        && u.output_tokens.is_none()
+        && u.cache_read_input_tokens.is_none()
+        && u.cache_creation_input_tokens.is_none()
+        && u.reasoning_output_tokens.is_none()
+        && u.cost.is_none()
 }
 
 fn try_observe(tx: &mpsc::Sender<ObserveMsg>, dropped: &AtomicBool, msg: ObserveMsg) {
@@ -552,6 +638,7 @@ fn try_observe(tx: &mpsc::Sender<ObserveMsg>, dropped: &AtomicBool, msg: Observe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_from_base(
     base: &RecordBase,
     usage: Usage,
@@ -560,6 +647,7 @@ fn record_from_base(
     error_kind: Option<String>,
     error_message: Option<String>,
     anomaly: Option<String>,
+    raw_usage: Option<String>,
 ) -> Record {
     Record {
         id: base.id.clone(),
@@ -581,6 +669,7 @@ fn record_from_base(
         client: base.client.clone(),
         endpoint: Some(base.endpoint.clone()),
         anomaly,
+        raw_usage,
     }
 }
 
@@ -959,5 +1048,36 @@ mod tests {
             sanitized,
             "error sending request for url (https://api.example.com/v1/messages)"
         );
+    }
+
+    #[test]
+    fn raw_usage_json_shapes_by_count_and_trust() {
+        let one = serde_json::json!({"prompt_tokens": 10});
+        let two = serde_json::json!({"input_tokens": 5});
+        // Nothing captured.
+        assert_eq!(raw_usage_json(&[], true), None);
+        // Single object stays an object.
+        assert_eq!(
+            raw_usage_json(std::slice::from_ref(&one), true).as_deref(),
+            Some(r#"{"prompt_tokens":10}"#)
+        );
+        // Split usage (Anthropic) becomes an array.
+        let arr = raw_usage_json(&[one.clone(), two], true).unwrap();
+        assert!(arr.starts_with('[') && arr.contains("input_tokens"));
+        // A degraded observation stores nothing, even with objects in hand.
+        assert_eq!(raw_usage_json(std::slice::from_ref(&one), false), None);
+    }
+
+    #[test]
+    fn no_usage_canary_conditions() {
+        // Success + empty usage is the flagged case; anything else is not.
+        assert!(is_success(Some(200)) && usage_is_empty(&Usage::default()));
+        assert!(!is_success(Some(500)));
+        assert!(!is_success(None));
+        let with_tokens = Usage {
+            output_tokens: Some(1),
+            ..Default::default()
+        };
+        assert!(!usage_is_empty(&with_tokens));
     }
 }

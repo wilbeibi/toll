@@ -60,10 +60,18 @@ pub struct Record {
     #[serde(default)]
     pub endpoint: Option<String>,
     /// Set when observation was degraded (`sse_overflow`,
-    /// `observation_dropped`): the call succeeded but token fields are
-    /// untrustworthy/absent for a toll-side reason, not a provider one.
+    /// `observation_dropped`) or when a successful inference reported no usage
+    /// at all (`no_usage`): the token fields are untrustworthy/absent for a
+    /// toll-side or provider-shape reason, not a genuine zero-cost call.
     #[serde(default)]
     pub anomaly: Option<String>,
+    /// Verbatim provider usage object(s) as sent on the wire, before toll
+    /// normalized them into the typed columns — a single JSON object for
+    /// most providers, a JSON array when usage arrives split across events
+    /// (Anthropic `message_start` + `message_delta`). Audit/backfill only;
+    /// preserves fields toll does not parse. `None` when no usage was seen.
+    #[serde(default)]
+    pub raw_usage: Option<String>,
 }
 
 pub struct Store {
@@ -119,7 +127,8 @@ impl Store {
                 cost                        REAL,
                 client                      TEXT,
                 endpoint                    TEXT,
-                anomaly                     TEXT
+                anomaly                     TEXT,
+                raw_usage                   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
@@ -130,6 +139,7 @@ impl Store {
         self.add_column("ALTER TABLE calls ADD COLUMN client TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN endpoint TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN anomaly TEXT")?;
+        self.add_column("ALTER TABLE calls ADD COLUMN raw_usage TEXT")?;
         Ok(())
     }
 
@@ -151,8 +161,8 @@ impl Store {
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 reasoning_output_tokens,
-                error_kind, error_message, cost, client, endpoint, anomaly
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                error_kind, error_message, cost, client, endpoint, anomaly, raw_usage
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 r.id,
                 r.ts,
@@ -173,6 +183,7 @@ impl Store {
                 r.client,
                 r.endpoint,
                 r.anomaly,
+                r.raw_usage,
             ],
         )?;
         Ok(())
@@ -238,7 +249,7 @@ impl Store {
                         input_tokens, output_tokens,
                         cache_read_input_tokens, cache_creation_input_tokens,
                         reasoning_output_tokens,
-                        error_kind, error_message, cost, client, endpoint, anomaly
+                        error_kind, error_message, cost, client, endpoint, anomaly, raw_usage
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -264,6 +275,7 @@ impl Store {
                         client: row.get(16)?,
                         endpoint: row.get(17)?,
                         anomaly: row.get(18)?,
+                        raw_usage: row.get(19)?,
                     })
                 },
             )
@@ -334,6 +346,7 @@ mod tests {
             client: Some("test-agent/1.0".into()),
             endpoint: Some("/v1/chat/completions".into()),
             anomaly: None,
+            raw_usage: Some(r#"{"prompt_tokens":50,"completion_tokens":25}"#.into()),
         }
     }
 
@@ -366,6 +379,7 @@ mod tests {
         assert_eq!(back.client, rec.client);
         assert_eq!(back.endpoint, rec.endpoint);
         assert_eq!(back.anomaly, rec.anomaly);
+        assert_eq!(back.raw_usage, rec.raw_usage);
     }
 
     #[test]

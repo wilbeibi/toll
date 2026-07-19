@@ -28,6 +28,21 @@ pub fn model_from_response_value(v: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The verbatim usage sub-object carried by a response object (streaming chunk
+/// or full body), across provider shapes — for audit storage in `raw_usage`,
+/// preserving fields the typed parsers normalize away. Mirrors the locations
+/// the `merge_*` functions read from: top-level `usage`/`usageMetadata`,
+/// Anthropic's `message.usage`, the Responses API's `response.usage`, and
+/// Groq's `x_groq.usage`. `None` when the object carries no usage.
+pub fn raw_usage_value(data: &Value) -> Option<Value> {
+    data.get("usage")
+        .or_else(|| data.get("usageMetadata"))
+        .or_else(|| data.get("message").and_then(|m| m.get("usage")))
+        .or_else(|| data.get("response").and_then(|r| r.get("usage")))
+        .or_else(|| data.get("x_groq").and_then(|x| x.get("usage")))
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +81,31 @@ mod tests {
             model_from_response_value(&serde_json::json!({"model": ""})),
             None
         );
+    }
+
+    #[test]
+    fn raw_usage_extracts_verbatim_across_shapes() {
+        // Preserves fields the typed parser drops (e.g. `num_sources_used`).
+        let openai = serde_json::json!({"usage": {"prompt_tokens": 10, "num_sources_used": 3}});
+        assert_eq!(
+            raw_usage_value(&openai),
+            Some(serde_json::json!({"prompt_tokens": 10, "num_sources_used": 3}))
+        );
+        // Anthropic message_start nests usage under `message`.
+        let start =
+            serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}});
+        assert_eq!(
+            raw_usage_value(&start),
+            Some(serde_json::json!({"input_tokens": 5}))
+        );
+        // Groq's final chunk carries usage under `x_groq`.
+        let groq =
+            serde_json::json!({"choices": [], "x_groq": {"usage": {"completion_tokens": 7}}});
+        assert_eq!(
+            raw_usage_value(&groq),
+            Some(serde_json::json!({"completion_tokens": 7}))
+        );
+        // No usage present.
+        assert_eq!(raw_usage_value(&serde_json::json!({"choices": []})), None);
     }
 }
