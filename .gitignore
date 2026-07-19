@@ -3,6 +3,10 @@
 *.swp
 .claude/
 
+# Local design / agent notes — kept out of the public repo
+/DESIGN.md
+/AGENTS.md
+
 
 # Added by cargo
 #

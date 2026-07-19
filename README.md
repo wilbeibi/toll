@@ -1,61 +1,33 @@
 # toll
 
-**See exactly where your LLM API spend goes — without routing your keys through anyone's cloud.**
+### See which of your tools is spending your LLM API money
 
-`toll` is a localhost reverse proxy that logs every LLM API call your tools make —
-model, tokens, cost, latency, cache hits, status, errors, and which tool made the
-call — into a local SQLite database. Point any OpenAI-, Anthropic-, or
-Gemini-compatible client (10 providers built in) at `127.0.0.1`, keep using your
-existing API keys, and query usage from your terminal.
+`toll` is for the moment your API bill is bigger than you expected and you can't
+tell which tool ran it up. I had a handful of LLM tools on this laptop — a coding
+agent, a couple of chat CLIs, a script that summarizes pages — all billing to the
+same keys, with no way to split the cost. So I built this, and it's been running
+ever since.
 
-It is a **meter, not a gateway**: it forwards every request byte-for-byte and gets
-out of the way. No routing, no rate limiting, no key vault, no account, no hosted
-dashboard. If toll's recording breaks, your request still succeeds.
+toll sits on your machine, between your tools and the provider APIs. Point a tool
+at toll instead of the provider, keep the same API key, and it writes down every
+call: which model, how many tokens, what it cost, how long it took, and which
+tool made it. You read it back from the terminal.
 
-Use it to answer:
+It only watches. Each request goes to the provider unchanged; toll records what
+happened on the side. Nothing leaves your machine, and if the logging ever
+breaks, your request still goes through.
 
-- Which tool spent the most money today? Which model ate the most tokens?
-- Did a failed request still reach the provider (and bill me)?
-- Are my cache hits actually landing?
-- What did my agent call in the last 10 minutes?
-- Which local tools are quietly sending traffic to which APIs?
+Use it when you want to know:
 
-```text
-your client ──▶ http://127.0.0.1:<provider-port> ──▶ provider API   (forwarded verbatim)
-                            │
-                            └──▶ local SQLite usage log              (out-of-band)
-```
+- Which tool spent the most today, and which model ate the most tokens.
+- Whether that failed request still reached the provider and billed you.
+- If your cache hits are actually landing.
+- Which local tools are quietly calling which APIs.
 
-## Quick start
+Works with **OpenAI**, **Anthropic**, **Gemini**, **DeepSeek**, **OpenRouter**,
+**Kimi**, **MiniMax**, **GLM**, **xAI**, and **Groq**.
 
-```zsh
-git clone https://github.com/wilbeibi/toll
-cd toll
-cargo install --path .
-toll start                 # runs the listeners in the foreground
-toll prices pull           # optional: fetch a price table so costs are filled in
-```
-
-In another shell, point a client at toll and start using it as normal:
-
-```zsh
-eval $(toll config --provider openrouter)   # export OPENAI_BASE_URL=http://127.0.0.1:4004/api/v1
-# fish:  toll config --provider xai --format fish | source
-```
-
-`toll config` with no provider prints an annotated list for every provider (OpenAI-shaped
-ones share `OPENAI_BASE_URL`, so pick one); `toll config --format url` prints the bare base
-URLs. Then inspect what you used:
-
-```zsh
-toll tail -n 10 --since 2h
-toll stats --since 7d
-toll stats --by-model
-toll stats --by-client     # which tool spent it (x-toll-client / User-Agent)
-toll stats --by-day        # daily trend
-```
-
-## Example output
+## What it looks like
 
 ```text
 $ toll tail -n 4
@@ -76,11 +48,49 @@ gpt-4.1-mini           2      2047     207      980         0            48%    
 qwen/qwen3-coder-480b  1      44021    12134    0           0            -       0       2100    2100    0.0700
 ```
 
-Add `--json` to either command for machine-readable output (`toll stats --json`,
-`toll tail --json`), including the computed cost and, for `tail`, whether that cost
-was `provider`-reported or `computed`.
+## Install
 
-## Supported providers
+```zsh
+git clone https://github.com/wilbeibi/toll
+cd toll
+cargo install --path .
+toll start                 # start the listeners (runs in the foreground)
+toll prices pull           # optional: pull a price table so costs are filled in
+```
+
+## Usage
+
+Point a tool at toll and use it exactly as before:
+
+```zsh
+eval $(toll config --provider openrouter)   # sets OPENAI_BASE_URL to http://127.0.0.1:4004/api/v1
+# fish:  toll config --provider xai --format fish | source
+```
+
+`toll config` with no provider lists every provider (the OpenAI-shaped ones share
+one base URL, so pick any); `toll config --format url` prints just the URLs.
+
+Then read back what you used:
+
+```zsh
+toll tail -n 10 --since 2h
+toll stats --since 7d
+toll stats --by-model
+toll stats --by-client     # which tool spent it
+toll stats --by-day        # daily trend
+```
+
+Add `--json` to `stats` or `tail` for machine-readable output.
+
+### Providers and ports
+
+Each provider has its own local port (below). You can also skip the ports and use
+names: `http://<provider>.localhost:4000` routes by name from any toll port, so
+there's one to remember instead of ten. That needs a client that resolves
+`*.localhost` to your own machine — most browsers and Linux do, macOS and slim
+containers sometimes don't, so if a name won't connect, use the `127.0.0.1` port.
+A mistyped name is refused either way, never sent to the wrong provider with the
+wrong key.
 
 | Provider | Local base URL | Upstream |
 | --- | --- | --- |
@@ -95,68 +105,45 @@ was `provider`-reported or `computed`.
 | xAI | `http://127.0.0.1:4008/v1` | `https://api.x.ai` |
 | Groq | `http://127.0.0.1:4009/openai/v1` | `https://api.groq.com` |
 
-Prefer names over ports: every listener also routes by Host, so
-`http://<provider>.localhost:4000<path>` works from any toll port — one port to
-remember, e.g. `http://openrouter.localhost:4000/api/v1`. Print them all with
-`toll config --format url`. A mistyped name (`typo.localhost`) is refused with 421
-rather than forwarded to the wrong provider with the wrong credentials.
-
 ## Cost
 
-Per-call cost prefers what the provider itself reports (OpenRouter's `usage.cost`,
-xAI's cost ticks, Groq's `x_groq`, …). When the provider reports no cost, toll
-computes it from a local price table — pulled from [models.dev](https://models.dev)
-with `toll prices pull` — honoring each model's cache-read/creation rates and
-context-length tiers (once a prompt crosses a provider's threshold, the whole call
-reprices at the higher tier, the way Gemini/Grok/Claude bill it).
+Costs come from what the provider reports. When a provider doesn't report one,
+toll works it out from a local price table you can refresh:
 
 ```zsh
-toll prices pull    # refresh the local table from models.dev
-toll prices show    # which table is active and how many models it covers
+toll prices pull    # refresh the table from models.dev
+toll prices show    # what's loaded and how many models it covers
 ```
 
-toll never *estimates* tokens a provider did not report — it runs no local
-tokenizer. A successful call that returns no usage is stored with null tokens and a
-`no_usage` marker, never a guess, so silent loss is visible rather than mistaken for
-a free call. `stats` warns when token-bearing calls went unpriced and how stale the
-price table is.
+toll never guesses tokens a provider didn't report. A call that comes back with
+no usage is saved as exactly that — no counts, marked `no_usage` — so nothing
+quietly reads as free.
 
-> `stats` and `tail` (table and `--json`) include computed costs. Raw SQL over the
-> `cost` column sees only provider-reported costs and will undercount.
+## What it records, and what it doesn't
 
-## What toll records
+One row per call, usage only: time, provider, model, endpoint, status, latency,
+token counts, cost, and the tool that made the call.
 
-Usage metadata only, one SQLite row per call: timestamp, provider, model (the exact
-billing slug, `vendor/` prefix included), endpoint path, status, latency (and
-time-to-first-token), token counts (input / output / cache read / cache creation /
-reasoning), cost, the calling tool (the request `User-Agent`, or an `x-toll-client`
-header if your tool sets one), and an `anomaly` marker when toll's own observation
-was degraded. The provider's verbatim `usage` object is kept in `raw_usage` for
-audit. **Request and response bodies are never stored.** API keys and credentials in
-error text are redacted before anything is written.
-
-Records live at:
+**Your prompts and responses are never stored.** Keys or credentials that show up
+in error text are scrubbed before anything is written. It all lives in a local
+SQLite file you own:
 
 ```text
-${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db     # usage log
-${XDG_DATA_HOME:-$HOME/.local/share}/toll/prices.json  # price table
+${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
 ```
 
-## What toll does not do
+Read it with `stats` and `tail`, or open it with any SQLite tool. (The stored
+`cost` column holds only costs the provider itself reported; `stats` and `tail`
+add the computed ones, so use those for a full total.)
 
-- **Not a gateway.** No routing, load balancing, rate limiting, caching, retries,
-  budgets, or key vault. The only edit toll makes to a request is injecting
-  `stream_options.include_usage` on OpenAI-style streams, so the final chunk carries
-  token counts; everything else is forwarded byte-for-byte.
-- **Not multi-tenant or network-exposed.** Listeners bind `127.0.0.1` only, and all
-  data stays on your machine.
-- **Not a telemetry pipeline.** No spans or metrics to an external collector — just a
-  local SQLite log you own and can query with `stats`, `tail`, or plain SQL.
+## Boundaries
 
-Recording is out-of-band and fire-and-forget: the forward path never waits on it, and
-under backpressure toll drops observations rather than stall your stream.
+- A meter, not a gateway. It doesn't route, balance, cache, retry, hold budgets,
+  or store your keys.
+- Local only. Listeners bind `127.0.0.1`; nothing is network-exposed.
+- Usage metadata only. No prompt or response bodies, ever.
+- No external telemetry. Just the local file.
 
 ## Status
 
-`0.1.0`. Single Rust binary, MIT-licensed. See [`DESIGN.md`](DESIGN.md) for the
-architecture, invariants, and the record of what was deliberately left out.
+`0.1.0`. One Rust binary, MIT-licensed.
