@@ -2,6 +2,10 @@
 
 ### See which of your tools is spending your LLM API money
 
+<p align="center">
+  <img src="assets/toll-banner.png" alt="toll watches streams of LLM API usage and prints a cost receipt" width="800">
+</p>
+
 `toll` is for the moment your API bill is bigger than you expected and you can't
 tell which tool ran it up. I had a handful of LLM tools on this laptop — a coding
 agent, a couple of chat CLIs, a script that summarizes pages — all billing to the
