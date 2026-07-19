@@ -1,9 +1,9 @@
-# toll
+<h1 align="center">toll</h1>
 
-### See which of your tools is spending your LLM API money
+<h3 align="center">See which of your tools is spending your LLM API money</h3>
 
 <p align="center">
-  <img src="assets/toll-banner.png" alt="toll watches streams of LLM API usage and prints a cost receipt" width="800">
+  <img src="assets/toll-banner.png" alt="toll watches streams of LLM API usage and prints a cost receipt" width="720">
 </p>
 
 `toll` is for the moment your API bill is bigger than you expected and you can't
