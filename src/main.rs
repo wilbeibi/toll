@@ -3,6 +3,7 @@ mod config;
 mod json_usage;
 mod parsers;
 mod paths;
+mod peer;
 mod pricing;
 mod providers;
 mod proxy;
@@ -26,12 +27,14 @@ async fn main() -> anyhow::Result<()> {
             by_model,
             by_client,
             by_day,
+            by_exe,
             since,
             json,
         } => stats::run(stats::StatsOpts {
             by_model,
             by_client,
             by_day,
+            by_exe,
             since,
             json,
         })?,

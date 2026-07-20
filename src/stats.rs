@@ -9,6 +9,7 @@ pub struct StatsOpts {
     pub by_model: bool,
     pub by_client: bool,
     pub by_day: bool,
+    pub by_exe: bool,
     pub since: Option<String>,
     pub json: bool,
 }
@@ -38,13 +39,15 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     let conn = open_db(&path)?;
     let prices = PriceTable::load(&prices_json());
 
-    // col/key_label are always one of four known literal pairs, never user input.
+    // col/key_label are always one of five known literal pairs, never user input.
     let (col, key_label) = if opts.by_model {
         ("COALESCE(model, 'unknown')", "model")
     } else if opts.by_client {
         ("COALESCE(client, 'unknown')", "client")
     } else if opts.by_day {
         ("substr(ts, 1, 10)", "day")
+    } else if opts.by_exe {
+        ("COALESCE(peer_exe, 'unknown')", "exe")
     } else {
         ("provider", "provider")
     };

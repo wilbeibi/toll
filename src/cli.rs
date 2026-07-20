@@ -26,6 +26,11 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["by_model", "by_client"])]
         by_day: bool,
 
+        /// Group by resolved calling process (peer_exe; Linux-only, else every
+        /// row is unknown).
+        #[arg(long, conflicts_with_all = ["by_model", "by_client", "by_day"])]
+        by_exe: bool,
+
         /// Only include calls at or after this point: 30m, 12h, 7d, today,
         /// a date (2026-07-01), or an RFC-3339 instant.
         #[arg(long)]

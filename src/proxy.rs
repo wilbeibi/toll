@@ -1,12 +1,13 @@
 use crate::json_usage::JsonUsageExtractor;
 use crate::parsers::{model_from_request_body, model_from_response_value, raw_usage_value};
 use crate::paths::calls_db;
+use crate::peer::resolve_peer_exe;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
 use crate::record::{classify_error, Record, Store, Usage};
 use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
@@ -59,6 +60,9 @@ struct RecordBase {
     stream: bool,
     started: Instant,
     client: Option<String>,
+    /// Peer socket address, carried to the write task so the caller's process
+    /// can be resolved off the forward path (invariant 2).
+    peer: SocketAddr,
 }
 
 enum ObserveMsg {
@@ -115,10 +119,15 @@ pub async fn run_all() -> Result<()> {
         info!("toll [{}] listening on http://{}", provider.name, addr);
 
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .unwrap_or_else(|e| warn!("serve error: {e}"));
+            // ConnectInfo carries the peer SocketAddr into handle_request so
+            // the caller's process can be resolved from /proc (peer.rs).
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap_or_else(|e| warn!("serve error: {e}"));
         });
         handles.push(handle);
     }
@@ -135,6 +144,7 @@ pub async fn run_all() -> Result<()> {
 
 async fn handle_request(
     State(state): State<Arc<ProxyState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
     let t0 = Instant::now();
@@ -238,8 +248,9 @@ async fn handle_request(
                     endpoint: Some(endpoint.clone()),
                     anomaly: None,
                     raw_usage: None,
+                    peer_exe: None,
                 };
-                spawn_record_write(state.store.clone(), rec);
+                spawn_record_write(state.store.clone(), rec, peer);
             }
             return Err(StatusCode::BAD_GATEWAY);
         }
@@ -274,6 +285,7 @@ async fn handle_request(
         stream: is_sse,
         started: t0,
         client,
+        peer,
     };
 
     let observer_kind = if is_sse {
@@ -486,6 +498,7 @@ fn spawn_observer(
                             record_from_base(
                                 &base, usage, elapsed_ms, ttft_ms, None, None, anomaly, raw_usage,
                             ),
+                            base.peer,
                         );
                     }
                     return;
@@ -519,6 +532,7 @@ fn spawn_observer(
                                 anomaly,
                                 raw_usage,
                             ),
+                            base.peer,
                         );
                     }
                     return;
@@ -548,6 +562,7 @@ fn spawn_observer(
                                 anomaly,
                                 raw_usage,
                             ),
+                            base.peer,
                         );
                     }
                     return;
@@ -670,6 +685,9 @@ fn record_from_base(
         endpoint: Some(base.endpoint.clone()),
         anomaly,
         raw_usage,
+        // Resolved from the peer socket in spawn_record_write, off the
+        // forward path (invariant 2).
+        peer_exe: None,
     }
 }
 
@@ -748,8 +766,17 @@ fn is_inference_endpoint(endpoint: &str) -> bool {
     MARKERS.iter().any(|m| e.contains(m))
 }
 
-fn spawn_record_write(store: Arc<Mutex<Store>>, record: Record) {
+fn spawn_record_write(store: Arc<Mutex<Store>>, mut record: Record, peer: SocketAddr) {
     let handle = tokio::task::spawn_blocking(move || {
+        // Resolve the caller's process here, on the blocking pool: the /proc
+        // scan is detached from the forward path (invariant 2) and this task
+        // already blocks on the DB write, so it is the natural place for it.
+        // A client that exits before this task runs resolves to None, so
+        // persistent callers (agents, daemons) attribute reliably while
+        // one-shot scripts may not. No cache: the scan is O(system-wide fds),
+        // not call rate, and stays off-path — cheap enough here; add an inode
+        // cache only if a large /proc ever makes it show up under load.
+        record.peer_exe = resolve_peer_exe(peer);
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = s.insert(&record) {
             warn!("failed to write toll record: {e}");

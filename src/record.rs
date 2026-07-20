@@ -72,6 +72,13 @@ pub struct Record {
     /// preserves fields toll does not parse. `None` when no usage was seen.
     #[serde(default)]
     pub raw_usage: Option<String>,
+    /// Absolute path of the local process that opened the connection, resolved
+    /// passively from the peer socket via `/proc` (Linux only; `None` off
+    /// Linux, or when the process exited before the record was written).
+    /// Distinct from `client`: this is what toll *observed*, where `client` is
+    /// what the caller *declared*.
+    #[serde(default)]
+    pub peer_exe: Option<String>,
 }
 
 pub struct Store {
@@ -128,7 +135,8 @@ impl Store {
                 client                      TEXT,
                 endpoint                    TEXT,
                 anomaly                     TEXT,
-                raw_usage                   TEXT
+                raw_usage                   TEXT,
+                peer_exe                    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
@@ -140,6 +148,7 @@ impl Store {
         self.add_column("ALTER TABLE calls ADD COLUMN endpoint TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN anomaly TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN raw_usage TEXT")?;
+        self.add_column("ALTER TABLE calls ADD COLUMN peer_exe TEXT")?;
         Ok(())
     }
 
@@ -161,8 +170,9 @@ impl Store {
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 reasoning_output_tokens,
-                error_kind, error_message, cost, client, endpoint, anomaly, raw_usage
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                error_kind, error_message, cost, client, endpoint, anomaly, raw_usage,
+                peer_exe
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 r.id,
                 r.ts,
@@ -184,6 +194,7 @@ impl Store {
                 r.endpoint,
                 r.anomaly,
                 r.raw_usage,
+                r.peer_exe,
             ],
         )?;
         Ok(())
@@ -249,7 +260,8 @@ impl Store {
                         input_tokens, output_tokens,
                         cache_read_input_tokens, cache_creation_input_tokens,
                         reasoning_output_tokens,
-                        error_kind, error_message, cost, client, endpoint, anomaly, raw_usage
+                        error_kind, error_message, cost, client, endpoint, anomaly, raw_usage,
+                        peer_exe
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -276,6 +288,7 @@ impl Store {
                         endpoint: row.get(17)?,
                         anomaly: row.get(18)?,
                         raw_usage: row.get(19)?,
+                        peer_exe: row.get(20)?,
                     })
                 },
             )
@@ -347,6 +360,7 @@ mod tests {
             endpoint: Some("/v1/chat/completions".into()),
             anomaly: None,
             raw_usage: Some(r#"{"prompt_tokens":50,"completion_tokens":25}"#.into()),
+            peer_exe: Some("/usr/bin/test-tool".into()),
         }
     }
 
@@ -380,6 +394,7 @@ mod tests {
         assert_eq!(back.endpoint, rec.endpoint);
         assert_eq!(back.anomaly, rec.anomaly);
         assert_eq!(back.raw_usage, rec.raw_usage);
+        assert_eq!(back.peer_exe, rec.peer_exe);
     }
 
     #[test]
@@ -405,6 +420,9 @@ mod tests {
         store.insert(&sample_record("migrated")).unwrap();
         let back = store.get_by_id("migrated").unwrap();
         assert_eq!(back.client.as_deref(), Some("test-agent/1.0"));
+        // The newest appended column must also forward-migrate onto a DB
+        // created before it existed (invariant 4).
+        assert_eq!(back.peer_exe.as_deref(), Some("/usr/bin/test-tool"));
     }
 
     #[test]
