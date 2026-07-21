@@ -50,6 +50,7 @@ FROM g WHERE gap IS NOT NULL GROUP BY bucket ORDER BY MIN(gap);
 - **Absent traffic ≠ zero spend.** Subscription tools (Claude Code, Codex) bypass toll. Raw `SUM(cost)` also undercounts calls where the provider reported no cost — prefer `toll stats`, which fills from the price table.
 - **Each machine has its own DB.** joi and mini run separate toll instances; a one-host query is a one-host answer. (mini: `ssh mini`, fish shell.)
 - **Older rows are sparser.** `raw_usage`, `client`, `peer_exe` were added over time and are NULL on early rows; typed token columns are the complete series.
+- **A runtime UA names a runtime, not a tool.** Bare `node` / `python-requests` could be any script or harness (an eval runner fanning equal call-counts across models looks nothing like an agent). Corroborate with `peer_exe`, timestamps vs known runs, and the actual binary's shebang before attributing spend to a named tool — and treat equal-count multi-model bursts as one-shot evals, not recurring workload to optimize.
 
 ## Output contract
 
