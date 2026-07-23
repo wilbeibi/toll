@@ -115,13 +115,20 @@ turnpike check --budget 50/day -q || ntfy send "LLM budget blown"
 
 ### Providers and ports
 
-Each provider has its own local port (below). You can also skip the ports and use
-names: `http://<provider>.localhost:4000` routes by name from any turnpike port, so
-there's one to remember instead of ten. That needs a client that resolves
-`*.localhost` to your own machine — most browsers and Linux do, macOS and slim
-containers sometimes don't, so if a name won't connect, use the `127.0.0.1` port.
-A mistyped name is refused either way, never sent to the wrong provider with the
-wrong key.
+`turnpike config --provider <name>` sets the base URL for you, so you rarely type
+one by hand. When you do, there are two forms:
+
+- **By name** — `http://<provider>.localhost:4000/...` routes by hostname from *any*
+  turnpike port, so it's one number to remember instead of ten. turnpike answers on
+  both IPv4 and IPv6 loopback, so the name works whether the client reaches for
+  `127.0.0.1` or `::1`. It only needs a client that resolves `*.localhost` to your
+  machine — browsers and Linux do; macOS and slim containers sometimes don't, and
+  there you fall back to the port form.
+- **By port** — each provider has its own fixed port (below).
+
+Either way a mistyped name is refused, never sent to the wrong provider with the
+wrong key. The path suffix (`/v1`, `/api/v1`, …) just mirrors each vendor's own API,
+so your SDK's base URL lines up with the endpoint it will call.
 
 | Provider | Local base URL | Upstream |
 | --- | --- | --- |

@@ -17,7 +17,7 @@ use jiff::Timestamp;
 use log::{info, warn};
 use reqwest::{Body as ReqwestBody, Client};
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -114,22 +114,30 @@ pub async fn run_all() -> Result<()> {
             .fallback(handle_request)
             .with_state(Arc::new(state));
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], provider.default_port));
-        let listener = TcpListener::bind(addr).await?;
-        info!("turnpike [{}] listening on http://{}", provider.name, addr);
+        // Bind both loopback stacks. `<provider>.localhost` resolves to ::1
+        // before 127.0.0.1 on most systems, so an IPv4-only listener silently
+        // refuses the name-routed form. Two explicit loopback sockets fix that
+        // without widening exposure — never bind `::`/`0.0.0.0`, which would
+        // put turnpike's API keys on the network. IPv4 is required; the ::1
+        // bind is best-effort so IPv6-disabled hosts degrade to v4-only.
+        let port = provider.default_port;
+        let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(v4).await?;
+        info!("turnpike [{}] listening on http://{}", provider.name, v4);
+        handles.push(spawn_serve(listener, app.clone()));
 
-        let handle = tokio::spawn(async move {
-            // ConnectInfo carries the peer SocketAddr into handle_request so
-            // the caller's process can be resolved from /proc (peer.rs).
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .unwrap_or_else(|e| warn!("serve error: {e}"));
-        });
-        handles.push(handle);
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        match TcpListener::bind(v6).await {
+            Ok(listener) => {
+                info!("turnpike [{}] listening on http://{}", provider.name, v6);
+                handles.push(spawn_serve(listener, app));
+            }
+            Err(e) => warn!(
+                "turnpike [{}] IPv6 loopback bind failed ({e}); \
+                 {}.localhost may not resolve — use http://127.0.0.1:{port}",
+                provider.name, provider.name
+            ),
+        }
     }
 
     for h in handles {
@@ -140,6 +148,20 @@ pub async fn run_all() -> Result<()> {
     // DB is compact and query-ready at rest.
     store.lock().unwrap_or_else(|e| e.into_inner()).checkpoint();
     Ok(())
+}
+
+fn spawn_serve(listener: TcpListener, app: Router) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // ConnectInfo carries the peer SocketAddr into handle_request so the
+        // caller's process can be resolved from /proc (peer.rs).
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap_or_else(|e| warn!("serve error: {e}"));
+    })
 }
 
 async fn handle_request(
