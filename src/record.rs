@@ -51,7 +51,7 @@ pub struct Record {
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
     pub cost: Option<f64>,
-    /// Calling tool identity: `x-toll-client` header when set, else the
+    /// Calling tool identity: `x-turnpike-client` header when set, else the
     /// request `User-Agent`. Stored verbatim (truncated at capture).
     #[serde(default)]
     pub client: Option<String>,
@@ -62,20 +62,20 @@ pub struct Record {
     /// Set when observation was degraded (`sse_overflow`,
     /// `observation_dropped`) or when a successful inference reported no usage
     /// at all (`no_usage`): the token fields are untrustworthy/absent for a
-    /// toll-side or provider-shape reason, not a genuine zero-cost call.
+    /// turnpike-side or provider-shape reason, not a genuine zero-cost call.
     #[serde(default)]
     pub anomaly: Option<String>,
-    /// Verbatim provider usage object(s) as sent on the wire, before toll
+    /// Verbatim provider usage object(s) as sent on the wire, before turnpike
     /// normalized them into the typed columns — a single JSON object for
     /// most providers, a JSON array when usage arrives split across events
     /// (Anthropic `message_start` + `message_delta`). Audit/backfill only;
-    /// preserves fields toll does not parse. `None` when no usage was seen.
+    /// preserves fields turnpike does not parse. `None` when no usage was seen.
     #[serde(default)]
     pub raw_usage: Option<String>,
     /// Absolute path of the local process that opened the connection, resolved
     /// passively from the peer socket via `/proc` (Linux only; `None` off
     /// Linux, or when the process exited before the record was written).
-    /// Distinct from `client`: this is what toll *observed*, where `client` is
+    /// Distinct from `client`: this is what turnpike *observed*, where `client` is
     /// what the caller *declared*.
     #[serde(default)]
     pub peer_exe: Option<String>,
@@ -101,7 +101,7 @@ impl Store {
             .conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
         {
-            warn!("toll: shutdown checkpoint failed: {e}");
+            warn!("turnpike: shutdown checkpoint failed: {e}");
         }
     }
 

@@ -96,7 +96,7 @@ enum ObserverKind {
 
 pub async fn run_all() -> Result<()> {
     if !crate::paths::prices_json().exists() {
-        eprintln!("warning: no price table found; run `toll prices pull` to fetch one");
+        eprintln!("warning: no price table found; run `turnpike prices pull` to fetch one");
     }
     let client = Client::builder().use_rustls_tls().build()?;
     let store = Arc::new(Mutex::new(Store::open(&calls_db())?));
@@ -116,7 +116,7 @@ pub async fn run_all() -> Result<()> {
 
         let addr = SocketAddr::from(([127, 0, 0, 1], provider.default_port));
         let listener = TcpListener::bind(addr).await?;
-        info!("toll [{}] listening on http://{}", provider.name, addr);
+        info!("turnpike [{}] listening on http://{}", provider.name, addr);
 
         let handle = tokio::spawn(async move {
             // ConnectInfo carries the peer SocketAddr into handle_request so
@@ -157,13 +157,13 @@ async fn handle_request(
     let path = uri.path();
     let headers = parts.headers;
 
-    // `<provider>.localhost` in the Host header routes by name from any toll
+    // `<provider>.localhost` in the Host header routes by name from any turnpike
     // port; a plain host keeps the port's provider.
     let provider = match provider_from_host(&headers, uri.authority().map(|a| a.as_str())) {
         HostRoute::Named(p) => p,
         HostRoute::None => state.provider,
         HostRoute::Unknown(name) => {
-            warn!("toll: unknown provider alias {name:?}.localhost; refusing to forward");
+            warn!("turnpike: unknown provider alias {name:?}.localhost; refusing to forward");
             return Err(StatusCode::MISDIRECTED_REQUEST);
         }
     };
@@ -725,12 +725,12 @@ fn provider_from_host(headers: &HeaderMap, authority: Option<&str>) -> HostRoute
     }
 }
 
-/// Client identity for per-tool attribution: `x-toll-client` when the caller
+/// Client identity for per-tool attribution: `x-turnpike-client` when the caller
 /// sets one, else the request `User-Agent`. `HeaderValue::to_str` only
 /// passes visible-ASCII values, so byte truncation cannot split a char.
 fn client_from_headers(headers: &HeaderMap) -> Option<String> {
     let raw = headers
-        .get("x-toll-client")
+        .get("x-turnpike-client")
         .or_else(|| headers.get(header::USER_AGENT))?
         .to_str()
         .ok()?
@@ -743,7 +743,7 @@ fn client_from_headers(headers: &HeaderMap) -> Option<String> {
     Some(s)
 }
 
-/// toll records *inference* — requests that consume tokens and cost money.
+/// turnpike records *inference* — requests that consume tokens and cost money.
 /// The OpenAI-compatible inference surface (plus Anthropic / Gemini) is
 /// small and stable; the junk clients probe (`/api/tags`, `/version`,
 /// `/props`, model listings, ...) is open-ended. So we allowlist inference
@@ -779,7 +779,7 @@ fn spawn_record_write(store: Arc<Mutex<Store>>, mut record: Record, peer: Socket
         record.peer_exe = resolve_peer_exe(peer);
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = s.insert(&record) {
-            warn!("failed to write toll record: {e}");
+            warn!("failed to write turnpike record: {e}");
         }
     });
     std::mem::drop(handle);
@@ -1031,10 +1031,10 @@ mod tests {
     }
 
     #[test]
-    fn client_prefers_toll_header_over_user_agent() {
+    fn client_prefers_turnpike_header_over_user_agent() {
         let mut h = HeaderMap::new();
         h.insert("user-agent", "node".parse().unwrap());
-        h.insert("x-toll-client", "opencode".parse().unwrap());
+        h.insert("x-turnpike-client", "opencode".parse().unwrap());
         assert_eq!(client_from_headers(&h).as_deref(), Some("opencode"));
     }
 

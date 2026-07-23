@@ -1,12 +1,12 @@
 //! Passive caller attribution: resolve the local process behind a loopback
-//! connection to a toll listener, from its peer socket address.
+//! connection to a turnpike listener, from its peer socket address.
 //!
-//! This is what toll *observed* about who called, as opposed to the `client`
-//! column, which is what the caller *declared* via `x-toll-client` /
+//! This is what turnpike *observed* about who called, as opposed to the `client`
+//! column, which is what the caller *declared* via `x-turnpike-client` /
 //! `User-Agent`. It needs no cooperation from the caller — the value most
 //! callers never set — so it covers traffic that would otherwise be anonymous.
 //!
-//! toll's listeners bind `127.0.0.1` only (DESIGN.md invariant 9), so every
+//! turnpike's listeners bind `127.0.0.1` only (DESIGN.md invariant 9), so every
 //! peer is IPv4 loopback and appears in `/proc/net/tcp`; `tcp6` is never
 //! consulted. Resolution is best-effort and **expensive** (it scans every
 //! process's fds), so it runs only inside the detached record-write task, off
@@ -17,14 +17,14 @@ use std::net::SocketAddr;
 
 /// Absolute path of the executable behind `peer`, or `None` when it cannot be
 /// resolved: non-Linux, the process already exited, the socket is owned by
-/// another user toll cannot read, or its path is not UTF-8. Never panics.
+/// another user turnpike cannot read, or its path is not UTF-8. Never panics.
 ///
 /// Best-effort: resolution runs after the response, so it reads the socket's
 /// owner *then*, and under PID/inode reuse can occasionally name a different
 /// process. Treat the result as a hint, not proof.
 ///
 /// Cost: one `/proc/net/tcp` read plus a scan of `/proc/<pid>/fd` across every
-/// readable process — O(system-wide fds), not toll's call rate — per call.
+/// readable process — O(system-wide fds), not turnpike's call rate — per call.
 #[cfg(target_os = "linux")]
 pub fn resolve_peer_exe(peer: SocketAddr) -> Option<String> {
     // Listeners are IPv4-only, so a V6 peer cannot occur; refuse rather than
@@ -68,7 +68,7 @@ fn socket_inode(peer: std::net::SocketAddrV4) -> Option<u64> {
 /// PID holding an fd to the socket with `inode`, found by scanning
 /// `/proc/<pid>/fd/*` for a `socket:[inode]` symlink. Bad items — non-numeric
 /// `/proc` entries, processes that exited or belong to another user — are
-/// skipped, not fatal: an unprivileged toll resolves its own-user callers and
+/// skipped, not fatal: an unprivileged turnpike resolves its own-user callers and
 /// silently misses the rest.
 #[cfg(target_os = "linux")]
 fn pid_owning_inode(inode: u64) -> Option<u32> {

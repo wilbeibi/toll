@@ -1,24 +1,24 @@
 ---
-name: toll-spend-review
-description: Analyze toll's call database to answer two questions — where did the LLM API money go, and would a cheaper or better model do the same work. Use when the user asks "where is my LLM spend going", "toll spend review", "is there a cheaper model for this task", "token usage analysis", or wants a cost teardown of API traffic metered by toll. Do NOT use for subscription traffic (Claude Code, Codex) — it never passes through toll and is not in the database.
+name: turnpike-spend-review
+description: Analyze turnpike's call database to answer two questions — where did the LLM API money go, and would a cheaper or better model do the same work. Use when the user asks "where is my LLM spend going", "turnpike spend review", "is there a cheaper model for this task", "token usage analysis", or wants a cost teardown of API traffic metered by turnpike. Do NOT use for subscription traffic (Claude Code, Codex) — it never passes through turnpike and is not in the database.
 ---
 
-# toll-spend-review
+# turnpike-spend-review
 
-Turn toll's recorded facts into a spend report plus model-substitution suggestions. toll only records; all judgment (task type, quality tradeoffs, recommendations) happens here.
+Turn turnpike's recorded facts into a spend report plus model-substitution suggestions. turnpike only records; all judgment (task type, quality tradeoffs, recommendations) happens here.
 
 ## Data sources
 
-- `toll stats` / `toll tail` — first choice. Grouping: `--by-model | --by-client | --by-exe | --by-day`; filter `--since 30m|12h|7d|today|2026-07-01`; `--json` includes computed costs. Run `toll stats --help` for details.
-- `~/.local/share/toll/calls.db` — SQLite (WAL; read-only queries are safe), table `calls`. Key columns: `ts, provider, model, client, endpoint, peer_exe, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens, cost, raw_usage, anomaly`.
-- `~/.local/share/toll/prices.json` — current rates. Refresh with `toll prices pull` before repricing anything.
+- `turnpike stats` / `turnpike tail` — first choice. Grouping: `--by-model | --by-client | --by-exe | --by-day`; filter `--since 30m|12h|7d|today|2026-07-01`; `--json` includes computed costs. Run `turnpike stats --help` for details.
+- `~/.local/share/turnpike/calls.db` — SQLite (WAL; read-only queries are safe), table `calls`. Key columns: `ts, provider, model, client, endpoint, peer_exe, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens, cost, raw_usage, anomaly`.
+- `~/.local/share/turnpike/prices.json` — current rates. Refresh with `turnpike prices pull` before repricing anything.
 - Quality benchmarks: fetch live (models.dev API, Artificial Analysis, LMArena) — never rank model quality from memory; it stales in weeks.
 
 ## Workflow
 
-1. `toll prices pull`, then survey: `toll stats --since 30d --json`, then `--by-exe`, `--by-client`, `--by-model` to find the dominant source × model pairs.
+1. `turnpike prices pull`, then survey: `turnpike stats --since 30d --json`, then `--by-exe`, `--by-client`, `--by-model` to find the dominant source × model pairs.
 2. Drill into the top pairs with SQL (below). Segment by provider before summing anything (see traps).
-3. Identify the task behind each expensive source. `client` (`x-toll-client: <tool>[:<task>]`) and `peer_exe` say *who*; if they don't reveal *what kind of work* (OCR / distillation / chat / coding), ask the user — never guess task type from token shape alone.
+3. Identify the task behind each expensive source. `client` (`x-turnpike-client: <tool>[:<task>]`) and `peer_exe` say *who*; if they don't reveal *what kind of work* (OCR / distillation / chat / coding), ask the user — never guess task type from token shape alone.
 4. Fetch current prices + benchmarks for candidate substitutes; recommend only same-task-class swaps, with estimated saving labeled "at current rates".
 
 Canonical drill-down (spend by source × model):
@@ -47,8 +47,8 @@ FROM g WHERE gap IS NOT NULL GROUP BY bucket ORDER BY MIN(gap);
 
 - **`cost` is historical.** Computed at insert time with then-current rates. Repricing the same tokens with today's `prices.json` can differ by >2× (provider price cuts). Report stored `cost` as "what was paid"; label any repriced split "at current rates". Never mix the two in one total.
 - **Cache accounting differs by provider.** OpenAI/DeepSeek/Gemini: `cache_read` is a *subset* of `input_tokens` (uncached = `input − cache_read`). Anthropic: cache fields are *additive* on top of `input_tokens`. Summing across providers without segmenting double-counts. `prices.json` records this per model as `cache_in_input`.
-- **Absent traffic ≠ zero spend.** Subscription tools (Claude Code, Codex) bypass toll. Raw `SUM(cost)` also undercounts calls where the provider reported no cost — prefer `toll stats`, which fills from the price table.
-- **Each machine has its own DB.** joi and mini run separate toll instances; a one-host query is a one-host answer. (mini: `ssh mini`, fish shell.)
+- **Absent traffic ≠ zero spend.** Subscription tools (Claude Code, Codex) bypass turnpike. Raw `SUM(cost)` also undercounts calls where the provider reported no cost — prefer `turnpike stats`, which fills from the price table.
+- **Each machine has its own DB.** joi and mini run separate turnpike instances; a one-host query is a one-host answer. (mini: `ssh mini`, fish shell.)
 - **Older rows are sparser.** `raw_usage`, `client`, `peer_exe` were added over time and are NULL on early rows; typed token columns are the complete series.
 - **A runtime UA names a runtime, not a tool.** Bare `node` / `python-requests` could be any script or harness (an eval runner fanning equal call-counts across models looks nothing like an agent). Corroborate with `peer_exe`, timestamps vs known runs, and the actual binary's shebang before attributing spend to a named tool — and treat equal-count multi-model bursts as one-shot evals, not recurring workload to optimize.
 

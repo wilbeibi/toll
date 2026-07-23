@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "toll", version, about = "Personal LLM API usage meter")]
+#[command(name = "turnpike", version, about = "Personal LLM API usage meter")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -18,7 +18,7 @@ pub enum Command {
         #[arg(long)]
         by_model: bool,
 
-        /// Group by calling client (x-toll-client / User-Agent).
+        /// Group by calling client (x-turnpike-client / User-Agent).
         #[arg(long, conflicts_with = "by_model")]
         by_client: bool,
 
@@ -56,7 +56,7 @@ pub enum Command {
         json: bool,
     },
 
-    /// Print configuration snippets for pointing clients at toll.
+    /// Print configuration snippets for pointing clients at turnpike.
     Config {
         /// Limit output to one provider.
         #[arg(short, long)]

@@ -9,7 +9,7 @@ pub enum ConfigFormat {
     Url,
 }
 
-/// Any toll listener routes `<provider>.localhost` by name, so the alias
+/// Any turnpike listener routes `<provider>.localhost` by name, so the alias
 /// form needs just one well-known port. 4000 is the canonical choice.
 const ALIAS_PORT: u16 = 4000;
 
@@ -63,7 +63,7 @@ fn print_exports(
 ) {
     if !single_provider {
         println!("# Multiple providers share OPENAI_BASE_URL.");
-        println!("# For pipeable shell output, use: toll config --provider <name>");
+        println!("# For pipeable shell output, use: turnpike config --provider <name>");
     }
     for p in providers {
         if let Some(tmpl) = p.env_template {

@@ -1,13 +1,17 @@
 [package]
-name = "toll"
+name = "turnpike"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Personal LLM API usage meter — localhost reverse proxy"
 license = "MIT"
+repository = "https://github.com/wilbeibi/turnpike"
+readme = "README.md"
+keywords = ["llm", "proxy", "metering", "cost", "openai"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "toll"
+name = "turnpike"
 path = "src/main.rs"
 
 [dependencies]

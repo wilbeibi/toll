@@ -4,15 +4,15 @@ check:
     cargo test
 
 smoke:
-    target/release/toll config --format json
-    target/release/toll stats
-    target/release/toll tail -n 20
+    target/release/turnpike config --format json
+    target/release/turnpike stats
+    target/release/turnpike tail -n 20
 
 restart:
-    systemctl --user restart toll.service
-    systemctl --user status toll.service --no-pager --lines=20
+    systemctl --user restart turnpike.service
+    systemctl --user status turnpike.service --no-pager --lines=20
 
 deploy:
     cargo install --path . --root ~/.local
-    systemctl --user restart toll.service
-    systemctl --user status toll.service --no-pager --lines=20
+    systemctl --user restart turnpike.service
+    systemctl --user status turnpike.service --no-pager --lines=20

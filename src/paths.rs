@@ -3,10 +3,10 @@ use std::path::PathBuf;
 pub fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_DATA_HOME") {
         if !d.is_empty() {
-            return PathBuf::from(d).join("toll");
+            return PathBuf::from(d).join("turnpike");
         }
     }
-    dirs_fallback().join(".local/share/toll")
+    dirs_fallback().join(".local/share/turnpike")
 }
 
 pub fn calls_db() -> PathBuf {

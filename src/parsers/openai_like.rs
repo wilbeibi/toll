@@ -81,7 +81,7 @@ pub fn parse_openai(body: &Value) -> Usage {
 }
 
 /// OpenAI-compatible SSE: `usage` appears in the final chunk when
-/// `stream_options.include_usage=true`. toll injects that option automatically.
+/// `stream_options.include_usage=true`. turnpike injects that option automatically.
 /// Responses API streams (xAI, OpenAI /v1/responses) instead nest the final
 /// usage inside the `response.completed` event's response object.
 pub fn merge_openai_sse(_event_type: &str, data: &Value, into: &mut Usage) {

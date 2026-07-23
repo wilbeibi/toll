@@ -1,23 +1,23 @@
-<h1 align="center">toll</h1>
+<h1 align="center">turnpike</h1>
 
 <h3 align="center">See which of your tools is spending your LLM API money</h3>
 
 <p align="center">
-  <img src="assets/toll-banner.png" alt="toll watches streams of LLM API usage and prints a cost receipt" width="720">
+  <img src="assets/turnpike-banner.png" alt="turnpike watches streams of LLM API usage and prints a cost receipt" width="720">
 </p>
 
-`toll` is for the moment your API bill is bigger than you expected and you can't
+`turnpike` is for the moment your API bill is bigger than you expected and you can't
 tell which tool ran it up. I had a handful of LLM tools on this laptop — a coding
 agent, a couple of chat CLIs, a script that summarizes pages — all billing to the
 same keys, with no way to split the cost. So I built this, and it's been running
 ever since.
 
-toll sits on your machine, between your tools and the provider APIs. Point a tool
-at toll instead of the provider, keep the same API key, and it writes down every
+turnpike sits on your machine, between your tools and the provider APIs. Point a tool
+at turnpike instead of the provider, keep the same API key, and it writes down every
 call: which model, how many tokens, what it cost, how long it took, and which
 tool made it. You read it back from the terminal.
 
-It only watches. Each request goes to the provider unchanged; toll records what
+It only watches. Each request goes to the provider unchanged; turnpike records what
 happened on the side. Nothing leaves your machine, and if the logging ever
 breaks, your request still goes through.
 
@@ -34,7 +34,7 @@ Works with **OpenAI**, **Anthropic**, **Gemini**, **DeepSeek**, **OpenRouter**,
 ## What it looks like
 
 ```text
-$ toll tail -n 4
+$ turnpike tail -n 4
 
 [2026-07-19T10:42:18Z] anthropic claude-sonnet-4-5 200 1243ms tokens=16200→2450 cache_read=45200 $0.1132 client=opencode/0.4
 [2026-07-19T10:50:02Z] anthropic claude-sonnet-4-5 429 820ms tokens=? $0.0000 ERROR=rate_limit client=opencode/0.4
@@ -43,7 +43,7 @@ $ toll tail -n 4
 ```
 
 ```text
-$ toll stats --by-model
+$ turnpike stats --by-model
 
 model                  calls  input    output   cache_read  cache_write  cache%  errors  p50_ms  p95_ms  cost_usd
 ---------------------  -----  -------  -------  ----------  -----------  ------  ------  ------  ------  ----------
@@ -55,33 +55,33 @@ qwen/qwen3-coder-480b  1      44021    12134    0           0            -      
 ## Install
 
 ```zsh
-git clone https://github.com/wilbeibi/toll
-cd toll
+git clone https://github.com/wilbeibi/turnpike
+cd turnpike
 cargo install --path .
-toll start                 # start the listeners (runs in the foreground)
-toll prices pull           # optional: pull a price table so costs are filled in
+turnpike start                 # start the listeners (runs in the foreground)
+turnpike prices pull           # optional: pull a price table so costs are filled in
 ```
 
 ## Usage
 
-Point a tool at toll and use it exactly as before:
+Point a tool at turnpike and use it exactly as before:
 
 ```zsh
-eval $(toll config --provider openrouter)   # sets OPENAI_BASE_URL to http://127.0.0.1:4004/api/v1
-# fish:  toll config --provider xai --format fish | source
+eval $(turnpike config --provider openrouter)   # sets OPENAI_BASE_URL to http://127.0.0.1:4004/api/v1
+# fish:  turnpike config --provider xai --format fish | source
 ```
 
-`toll config` with no provider lists every provider (the OpenAI-shaped ones share
-one base URL, so pick any); `toll config --format url` prints just the URLs.
+`turnpike config` with no provider lists every provider (the OpenAI-shaped ones share
+one base URL, so pick any); `turnpike config --format url` prints just the URLs.
 
 Then read back what you used:
 
 ```zsh
-toll tail -n 10 --since 2h
-toll stats --since 7d
-toll stats --by-model
-toll stats --by-client     # which tool spent it
-toll stats --by-day        # daily trend
+turnpike tail -n 10 --since 2h
+turnpike stats --since 7d
+turnpike stats --by-model
+turnpike stats --by-client     # which tool spent it
+turnpike stats --by-day        # daily trend
 ```
 
 Add `--json` to `stats` or `tail` for machine-readable output.
@@ -89,7 +89,7 @@ Add `--json` to `stats` or `tail` for machine-readable output.
 ### Providers and ports
 
 Each provider has its own local port (below). You can also skip the ports and use
-names: `http://<provider>.localhost:4000` routes by name from any toll port, so
+names: `http://<provider>.localhost:4000` routes by name from any turnpike port, so
 there's one to remember instead of ten. That needs a client that resolves
 `*.localhost` to your own machine — most browsers and Linux do, macOS and slim
 containers sometimes don't, so if a name won't connect, use the `127.0.0.1` port.
@@ -112,14 +112,14 @@ wrong key.
 ## Cost
 
 Costs come from what the provider reports. When a provider doesn't report one,
-toll works it out from a local price table you can refresh:
+turnpike works it out from a local price table you can refresh:
 
 ```zsh
-toll prices pull    # refresh the table from models.dev
-toll prices show    # what's loaded and how many models it covers
+turnpike prices pull    # refresh the table from models.dev
+turnpike prices show    # what's loaded and how many models it covers
 ```
 
-toll never guesses tokens a provider didn't report. A call that comes back with
+turnpike never guesses tokens a provider didn't report. A call that comes back with
 no usage is saved as exactly that — no counts, marked `no_usage` — so nothing
 quietly reads as free.
 
@@ -133,7 +133,7 @@ in error text are scrubbed before anything is written. It all lives in a local
 SQLite file you own:
 
 ```text
-${XDG_DATA_HOME:-$HOME/.local/share}/toll/calls.db
+${XDG_DATA_HOME:-$HOME/.local/share}/turnpike/calls.db
 ```
 
 Read it with `stats` and `tail`, or open it with any SQLite tool. (The stored

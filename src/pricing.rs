@@ -89,7 +89,7 @@ impl PriceTable {
             Some(table) => table,
             None => {
                 if local_path.exists() {
-                    log::warn!("toll: ignoring malformed {}", local_path.display());
+                    log::warn!("turnpike: ignoring malformed {}", local_path.display());
                 }
                 Self {
                     map: HashMap::new(),
@@ -280,7 +280,7 @@ pub fn show(local_path: &Path) {
             None => println!("source: {} — unreadable or malformed", local_path.display()),
         }
     } else {
-        println!("no price table found — run `toll prices pull` to fetch one");
+        println!("no price table found — run `turnpike prices pull` to fetch one");
     }
 }
 

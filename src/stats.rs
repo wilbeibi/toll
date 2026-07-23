@@ -194,7 +194,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         };
         eprintln!(
             "\nwarning: {unpriced_calls} calls with tokens had no price and sum as $0 \
-             (top: {}); {age} — run `toll prices pull`",
+             (top: {}); {age} — run `turnpike prices pull`",
             names.join(", ")
         );
     }
