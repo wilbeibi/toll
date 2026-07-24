@@ -6,26 +6,28 @@
   <img src="assets/turnpike-banner.png" alt="turnpike watches streams of LLM API usage and prints a cost receipt" width="720">
 </p>
 
-`turnpike` is for the moment your API bill is bigger than you expected and you can't
-tell which tool ran it up. I had a handful of LLM tools on this laptop — a coding
-agent, a couple of chat CLIs, a script that summarizes pages — all billing to the
-same keys, with no way to split the cost. So I built this, and it's been running
-ever since.
+turnpike is a local LLM API cost tracker: a small proxy that sits between your tools
+and OpenAI, Anthropic, and friends, and writes down what every call actually cost.
 
-turnpike sits on your machine, between your tools and the provider APIs. Point a tool
-at turnpike instead of the provider, keep the same API key, and it writes down every
-call: which model, how many tokens, what it cost, how long it took, and which
-tool made it. You read it back from the terminal.
+Here's the situation it's for. Your API bill is bigger than you expected. You have a
+coding agent, a couple of chat CLIs, and some script you wrote at 1am that summarizes
+web pages — all on the same keys. One of them is the problem. You have no idea which.
 
-It only watches. Each request goes to the provider unchanged; turnpike records what
-happened on the side. Nothing leaves your machine, and if the logging ever
-breaks, your request still goes through.
+So: point a tool at turnpike instead of the provider, keep the same API key, and it
+writes down every call — model, tokens, cost, latency, and which tool made it. Then
+you read it back from the terminal. That's the whole thing.
 
-Use it when you want to know:
+It only watches. Your request goes upstream as you sent it — headers, key, body —
+with one exception: on streaming calls to OpenAI-shaped providers it sets
+`stream_options.include_usage`, which is the only reason the provider tells anyone
+the token counts. Everything else happens off to the side. Nothing leaves your
+machine, and if the recording breaks, your request still goes through.
+
+Questions it answers:
 
 - Which tool spent the most today, and which model ate the most tokens.
-- Whether that failed request still reached the provider and billed you.
-- If your cache hits are actually landing.
+- Whether that failed request still reached the provider and billed you anyway.
+- Whether your cache hits are actually landing.
 - Which local tools are quietly calling which APIs.
 
 Works with **OpenAI**, **Anthropic**, **Gemini**, **DeepSeek**, **OpenRouter**,
@@ -62,6 +64,30 @@ turnpike start                 # start the listeners (runs in the foreground)
 turnpike prices pull           # optional: pull a price table so costs are filled in
 ```
 
+Building needs a Rust toolchain; there are no prebuilt binaries yet.
+
+### Keeping it running
+
+`turnpike start` stays in the foreground and has no daemon mode. Your tools can only
+reach it while it's up, so give it to a supervisor and forget about it. On Linux,
+a user unit at `~/.config/systemd/user/turnpike.service`:
+
+```ini
+[Service]
+ExecStart=%h/.cargo/bin/turnpike start
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+```zsh
+systemctl --user enable --now turnpike
+```
+
+On macOS, a launchd agent or any process manager works the same way; a terminal
+tab or `tmux` window is fine while you're trying it out.
+
 ## Usage
 
 Point a tool at turnpike and use it exactly as before:
@@ -72,7 +98,8 @@ eval $(turnpike config --provider openrouter)   # sets OPENAI_BASE_URL to http:/
 ```
 
 `turnpike config` with no provider lists every provider (the OpenAI-shaped ones share
-one base URL, so pick any); `turnpike config --format url` prints just the URLs.
+one base URL, so pick any); `turnpike config --format url` prints just the URLs. Scripts
+and coding agents should run that rather than copy a URL out of this README.
 
 Then read back what you used:
 
@@ -88,9 +115,9 @@ Add `--json` to `stats` or `tail` for machine-readable output.
 
 ### Budget check
 
-Ask whether spend in a window has crossed a number you care about. `turnpike
-check` prints a one-line answer and, more usefully, sets its exit code — `0`
-under, `1` at or over, `2` on error:
+Pick a number you don't want to cross, and ask. `turnpike check` prints a one-line
+answer, and — the actually useful part — sets its exit code: `0` under, `1` at or
+over, `2` if something went wrong:
 
 ```zsh
 turnpike check --budget 50/day
@@ -102,8 +129,8 @@ turnpike check --budget 50/day --json
 
 The period is `day`, `week`, or `month` (calendar windows in your local time, so
 `month` lines up with a billing cycle), or any `--since` form for a rolling
-window (`300/7d`, `20/24h`). turnpike doesn't send the alert itself — it's a
-meter, not a notifier — so wire the reaction to whatever you already run:
+window (`300/7d`, `20/24h`). turnpike won't send the alert for you — it's a meter,
+not a notifier — so hook it up to whatever already yells at you:
 
 ```zsh
 # quiet, exit-code only: fire your own notifier when over
@@ -115,33 +142,37 @@ turnpike check --budget 50/day -q || ntfy send "LLM budget blown"
 
 ### Providers and ports
 
-`turnpike config --provider <name>` sets the base URL for you, so you rarely type
-one by hand. When you do, there are two forms:
+`turnpike config --provider <name>` sets the base URL for you, so you rarely type one
+by hand. When you do, address turnpike **by name**:
 
-- **By name** — `http://<provider>.localhost:4000/...` routes by hostname from *any*
-  turnpike port, so it's one number to remember instead of ten. turnpike answers on
-  both IPv4 and IPv6 loopback, so the name works whether the client reaches for
-  `127.0.0.1` or `::1`. It only needs a client that resolves `*.localhost` to your
-  machine — browsers and Linux do; macOS and slim containers sometimes don't, and
-  there you fall back to the port form.
-- **By port** — each provider has its own fixed port (below).
+```
+http://<provider>.localhost:4000<path>     # e.g. http://openai.localhost:4000/v1
+```
 
-Either way a mistyped name is refused, never sent to the wrong provider with the
-wrong key. The path suffix (`/v1`, `/api/v1`, …) just mirrors each vendor's own API,
-so your SDK's base URL lines up with the endpoint it will call.
+One port for every provider, and the name is just the provider's own — nothing to
+look up. A name turnpike doesn't know is refused outright, so a typo can never be
+sent to the wrong provider with the wrong key. turnpike answers on both IPv4 and
+IPv6 loopback, so the name works whether the client reaches for `127.0.0.1` or `::1`.
 
-| Provider | Local base URL | Upstream |
-| --- | --- | --- |
-| OpenAI | `http://127.0.0.1:4000/v1` | `https://api.openai.com` |
-| Anthropic | `http://127.0.0.1:4001` | `https://api.anthropic.com` |
-| Gemini | `http://127.0.0.1:4002` | `https://generativelanguage.googleapis.com` |
-| DeepSeek | `http://127.0.0.1:4003/v1` | `https://api.deepseek.com` |
-| OpenRouter | `http://127.0.0.1:4004/api/v1` | `https://openrouter.ai` |
-| Kimi | `http://127.0.0.1:4005/v1` | `https://api.moonshot.ai` |
-| MiniMax | `http://127.0.0.1:4006/v1` | `https://api.minimaxi.com` |
-| GLM | `http://127.0.0.1:4007/api/paas/v4` | `https://open.bigmodel.cn` |
-| xAI | `http://127.0.0.1:4008/v1` | `https://api.x.ai` |
-| Groq | `http://127.0.0.1:4009/openai/v1` | `https://api.groq.com` |
+The `<path>` suffix mirrors each vendor's own API, so your SDK's base URL lines up
+with the endpoint it will call — that part is the vendor's, not turnpike's.
+
+Each provider also listens on its own fixed port, which is the form `turnpike config`
+emits and the fallback when a client won't resolve `*.localhost` (browsers and Linux
+do; macOS and slim containers sometimes don't) — `http://127.0.0.1:<port><path>`:
+
+| Provider | Port | Path | Upstream |
+| --- | --- | --- | --- |
+| OpenAI | 4000 | `/v1` | `https://api.openai.com` |
+| Anthropic | 4001 | — | `https://api.anthropic.com` |
+| Gemini | 4002 | — | `https://generativelanguage.googleapis.com` |
+| DeepSeek | 4003 | `/v1` | `https://api.deepseek.com` |
+| OpenRouter | 4004 | `/api/v1` | `https://openrouter.ai` |
+| Kimi | 4005 | `/v1` | `https://api.moonshot.ai` |
+| MiniMax | 4006 | `/v1` | `https://api.minimaxi.com` |
+| GLM | 4007 | `/api/paas/v4` | `https://open.bigmodel.cn` |
+| xAI | 4008 | `/v1` | `https://api.x.ai` |
+| Groq | 4009 | `/openai/v1` | `https://api.groq.com` |
 
 ## Cost
 
@@ -174,11 +205,28 @@ Read it with `stats` and `tail`, or open it with any SQLite tool. (The stored
 `cost` column holds only costs the provider itself reported; `stats` and `tail`
 add the computed ones, so use those for a full total.)
 
+## Alternatives
+
+There are bigger tools in this space. Most of them do more than you need for
+"which of my laptop's tools is burning money":
+
+| | What it is | Why you might not want it here |
+| --- | --- | --- |
+| **LiteLLM / gateways** | routing, load balancing, key vaults, fallbacks | holds your keys, rewrites requests, one endpoint for everything — a mistyped model can land on the wrong provider |
+| **Helicone, Langfuse, Braintrust** | hosted LLM observability, traces, prompt history | your prompts leave the machine, and you get an account, a dashboard, and a bill |
+| **Provider dashboards** | the numbers the vendor already has | one per provider, a day late, and no idea which local tool made the call |
+| **turnpike** | a local meter, one SQLite file | doesn't route, cache, retry, or hold keys — if you want a gateway, this isn't one |
+
+The short version: if you want a control plane, use LiteLLM. If you want a trace
+viewer for a production app, use Langfuse. If you want to know which thing on your
+laptop spent $40 last Tuesday, that's this.
+
 ## Boundaries
 
 - A meter, not a gateway. It doesn't route, balance, cache, retry, hold budgets,
   or store your keys.
-- Local only. Listeners bind `127.0.0.1`; nothing is network-exposed.
+- Local only. Listeners bind loopback (`127.0.0.1` and `::1`), never `0.0.0.0`;
+  nothing is network-exposed.
 - Usage metadata only. No prompt or response bodies, ever.
 - No external telemetry. Just the local file.
 
