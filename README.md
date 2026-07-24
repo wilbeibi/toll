@@ -86,15 +86,49 @@ turnpike stats --by-day        # daily trend
 
 Add `--json` to `stats` or `tail` for machine-readable output.
 
+### Budget check
+
+Ask whether spend in a window has crossed a number you care about. `turnpike
+check` prints a one-line answer and, more usefully, sets its exit code — `0`
+under, `1` at or over, `2` on error:
+
+```zsh
+turnpike check --budget 50/day
+# day: $14.20 / $50.00 (28%) — ok
+
+turnpike check --budget 50/day --json
+# {"window":"day","spent":14.2,"budget":50.0,"over":false,"remaining":35.8, ...}
+```
+
+The period is `day`, `week`, or `month` (calendar windows in your local time, so
+`month` lines up with a billing cycle), or any `--since` form for a rolling
+window (`300/7d`, `20/24h`). turnpike doesn't send the alert itself — it's a
+meter, not a notifier — so wire the reaction to whatever you already run:
+
+```zsh
+# quiet, exit-code only: fire your own notifier when over
+turnpike check --budget 50/day -q || ntfy send "LLM budget blown"
+
+# a shell prompt segment, a cron/timer line, or a coding-agent hook can all
+# just run `turnpike check` and branch on the exit code
+```
+
 ### Providers and ports
 
-Each provider has its own local port (below). You can also skip the ports and use
-names: `http://<provider>.localhost:4000` routes by name from any turnpike port, so
-there's one to remember instead of ten. That needs a client that resolves
-`*.localhost` to your own machine — most browsers and Linux do, macOS and slim
-containers sometimes don't, so if a name won't connect, use the `127.0.0.1` port.
-A mistyped name is refused either way, never sent to the wrong provider with the
-wrong key.
+`turnpike config --provider <name>` sets the base URL for you, so you rarely type
+one by hand. When you do, there are two forms:
+
+- **By name** — `http://<provider>.localhost:4000/...` routes by hostname from *any*
+  turnpike port, so it's one number to remember instead of ten. turnpike answers on
+  both IPv4 and IPv6 loopback, so the name works whether the client reaches for
+  `127.0.0.1` or `::1`. It only needs a client that resolves `*.localhost` to your
+  machine — browsers and Linux do; macOS and slim containers sometimes don't, and
+  there you fall back to the port form.
+- **By port** — each provider has its own fixed port (below).
+
+Either way a mistyped name is refused, never sent to the wrong provider with the
+wrong key. The path suffix (`/v1`, `/api/v1`, …) just mirrors each vendor's own API,
+so your SDK's base URL lines up with the endpoint it will call.
 
 | Provider | Local base URL | Upstream |
 | --- | --- | --- |

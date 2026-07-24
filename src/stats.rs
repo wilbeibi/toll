@@ -1,6 +1,6 @@
 use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
-use crate::record::{open_db, Usage};
+use crate::record::open_db;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,43 +95,19 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     for row in rows.filter_map(|r| r.ok()) {
         let (grp, model, input, output, cache_read, cache_write, stored_cost, is_error, lat) = row;
 
-        let call_cost = match stored_cost {
+        let usage = crate::cost::usage_from_counts(input, output, cache_read, cache_write);
+        let call_cost = match crate::cost::call_cost(&prices, model.as_deref(), stored_cost, &usage)
+        {
             Some(c) => c,
             None => {
-                let usage = Usage {
-                    input_tokens: if input > 0 { Some(input as u64) } else { None },
-                    output_tokens: if output > 0 {
-                        Some(output as u64)
-                    } else {
-                        None
-                    },
-                    cache_read_input_tokens: if cache_read > 0 {
-                        Some(cache_read as u64)
-                    } else {
-                        None
-                    },
-                    cache_creation_input_tokens: if cache_write > 0 {
-                        Some(cache_write as u64)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                };
-                match prices.compute(model.as_deref(), &usage) {
-                    Some(c) => c,
-                    None => {
-                        // Token-bearing rows summed at $0 would silently
-                        // under-report; count them and say so below. Rows
-                        // with no tokens (pure errors) genuinely cost nothing.
-                        if input > 0 || output > 0 {
-                            unpriced_calls += 1;
-                            *unpriced_models
-                                .entry(model.clone().unwrap_or_else(|| "unknown".into()))
-                                .or_insert(0) += 1;
-                        }
-                        0.0
-                    }
-                }
+                // Token-bearing rows with no price would silently under-report;
+                // count them and warn below. Rows with no tokens (pure errors)
+                // price to a definite $0 and never reach this arm.
+                unpriced_calls += 1;
+                *unpriced_models
+                    .entry(model.clone().unwrap_or_else(|| "unknown".into()))
+                    .or_insert(0) += 1;
+                0.0
             }
         };
 

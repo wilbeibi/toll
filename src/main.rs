@@ -1,5 +1,7 @@
+mod check;
 mod cli;
 mod config;
+mod cost;
 mod json_usage;
 mod parsers;
 mod paths;
@@ -39,6 +41,32 @@ async fn main() -> anyhow::Result<()> {
             json,
         })?,
         Command::Tail { n, since, json } => tail::run(n, since, json)?,
+        Command::Check {
+            budget,
+            quiet,
+            json,
+        } => {
+            // Distinct exit codes are the whole contract: 0 = under budget,
+            // 1 = at/over budget (the branchable signal), 2 = error. Keeping
+            // errors off code 1 means `check … || alert` never fires on a
+            // typo'd budget or a database problem.
+            let verdict = check::parse_budget(&budget).and_then(|(budget, period)| {
+                check::run(check::CheckOpts {
+                    budget,
+                    period,
+                    json,
+                    quiet,
+                })
+            });
+            match verdict {
+                Ok(true) => std::process::exit(1),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("turnpike: {e:#}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Command::Config { format, provider } => config::run(
             match format {
                 cli::Format::Shell => config::ConfigFormat::Shell,
