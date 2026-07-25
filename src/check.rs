@@ -1,8 +1,8 @@
 //! `turnpike check` — answer one question with an exit code: is spend in a
 //! window at or over a budget? It reads the call database exactly like `stats`
-//! and touches no daemon state. Delivery is not turnpike's job: the exit code
-//! composes with whatever you already run (`... || ntfy send ...`, a coding-
-//! agent hook, a shell prompt), so turnpike stays a meter, not a notifier.
+//! and touches no daemon state. Delivery is not turnpike's job: callers inspect
+//! the exit code from a coding-agent hook, shell prompt, or notifier wrapper, so
+//! turnpike stays a meter, not a notifier.
 
 use crate::cost::{call_cost, usage_from_counts};
 use crate::paths::{calls_db, prices_json};
@@ -40,58 +40,93 @@ pub fn parse_budget(spec: &str) -> Result<(f64, String)> {
     Ok((budget, period.to_string()))
 }
 
+/// The budget verdict — `over`, `remaining`, and `pct` — derived purely from
+/// spend and budget with no IO. Extracted from [`run`] so the at/over boundary
+/// (equal spend counts as over — the whole exit-code contract) is unit-testable
+/// without a database or captured stdout.
+struct Verdict {
+    over: bool,
+    remaining: f64,
+    pct: f64,
+}
+
+impl Verdict {
+    fn new(spent: f64, budget: f64) -> Self {
+        // `budget` is guaranteed finite and > 0 by `parse_budget`, so the
+        // division and comparison are always well-defined.
+        Self {
+            over: spent >= budget,
+            remaining: budget - spent,
+            pct: spent / budget * 100.0,
+        }
+    }
+}
+
 /// Returns `true` when spend in the window is at or over budget — the caller
 /// maps that to process exit code 1.
 pub fn run(opts: CheckOpts) -> Result<bool> {
     let lower = window_bound(&opts.period)?;
 
     let path = calls_db();
-    let (spent, unpriced) = if path.exists() {
-        let conn = open_db(&path)?;
-        let prices = PriceTable::load(&prices_json());
-        sum_spend(&conn, &prices, &lower)?
-    } else {
-        (0.0, 0)
-    };
+    if !path.exists() {
+        bail!(
+            "call database not found at {}; cannot determine spend",
+            path.display()
+        );
+    }
+    let conn = open_db(&path)?;
+    let prices = PriceTable::load(&prices_json());
+    let (spent, unpriced) = sum_spend(&conn, &prices, &lower)?;
 
-    let over = spent >= opts.budget;
-    let remaining = opts.budget - spent;
-    let pct = spent / opts.budget * 100.0;
+    let v = Verdict::new(spent, opts.budget);
+
+    // Known spend over the ceiling is decisive even if other calls are
+    // unpriced. Below the ceiling, unpriced calls make the answer unknowable;
+    // surface that as an error instead of returning a false "under" verdict.
+    if !v.over && unpriced > 0 {
+        bail!(
+            "{unpriced} calls with tokens have no price; cannot determine whether spend is under budget; run `turnpike prices pull`"
+        );
+    }
 
     if opts.json {
-        let v = serde_json::json!({
+        let out = serde_json::json!({
             "window": opts.period,
             "since": lower,
             "spent": spent,
             "budget": opts.budget,
-            "pct": pct,
-            "over": over,
-            "remaining": remaining,
+            "pct": v.pct,
+            "over": v.over,
+            "remaining": v.remaining,
             "unpriced_calls": unpriced,
         });
         println!(
             "{}",
-            serde_json::to_string(&v).expect("serializing known-valid JSON")
+            serde_json::to_string(&out).expect("serializing known-valid JSON")
         );
     } else if !opts.quiet {
-        let verdict = if over {
-            format!("OVER by ${:.2}", -remaining)
+        let label = if v.over {
+            format!("OVER by ${:.2}", -v.remaining)
         } else {
             "ok".to_string()
         };
         println!(
             "{}: ${:.2} / ${:.2} ({:.0}%) — {}",
-            opts.period, spent, opts.budget, pct, verdict
+            opts.period, spent, opts.budget, v.pct, label
         );
-        if unpriced > 0 {
-            eprintln!(
-                "warning: {unpriced} calls with tokens had no price and count as $0 — \
-                 real spend may be higher; run `turnpike prices pull`"
-            );
-        }
     }
 
-    Ok(over)
+    // Reaching here with unpriced calls means known spend already proves the
+    // budget is exceeded. Preserve that verdict, but disclose that the total is
+    // only a lower bound.
+    if unpriced > 0 {
+        eprintln!(
+            "warning: {unpriced} calls with tokens had no price and count as $0 — \
+             real spend may be higher; run `turnpike prices pull`"
+        );
+    }
+
+    Ok(v.over)
 }
 
 /// Total USD spent since `lower`, and the count of token-bearing calls that had
@@ -120,8 +155,8 @@ fn sum_spend(conn: &Connection, prices: &PriceTable, lower: &str) -> Result<(f64
 
     let mut spent = 0.0;
     let mut unpriced = 0i64;
-    for row in rows.filter_map(|r| r.ok()) {
-        let (model, input, output, cache_read, cache_write, stored) = row;
+    for row in rows {
+        let (model, input, output, cache_read, cache_write, stored) = row?;
         let usage = usage_from_counts(input, output, cache_read, cache_write);
         match call_cost(prices, model.as_deref(), stored, &usage) {
             Some(c) => spent += c,
@@ -138,6 +173,10 @@ fn sum_spend(conn: &Connection, prices: &PriceTable, lower: &str) -> Result<(f64
 /// `24h` work too.
 fn window_bound(period: &str) -> Result<String> {
     let now = Zoned::now();
+    window_bound_at(period, &now)
+}
+
+fn window_bound_at(period: &str, now: &Zoned) -> Result<String> {
     let today = now.datetime().date();
     let start = match period {
         "day" => today,
@@ -160,7 +199,6 @@ fn window_bound(period: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jiff::Timestamp;
 
     #[test]
     fn parse_budget_amount_and_period() {
@@ -179,16 +217,61 @@ mod tests {
     }
 
     #[test]
-    fn calendar_windows_resolve_before_now_and_utc() {
-        let now = Timestamp::now().to_string();
-        for period in ["day", "week", "month"] {
-            let bound = window_bound(period).unwrap();
-            assert!(
-                bound <= now,
-                "{period}: {bound} should sort at/before {now}"
-            );
-            assert!(bound.ends_with('Z'), "{period}: {bound} must be UTC");
-        }
+    fn verdict_counts_equal_spend_as_over() {
+        // The exit-code contract is "at or over": under stays under, but spend
+        // exactly equal to the budget must trip to over (the boundary the whole
+        // `check … || alert` idiom hinges on).
+        assert!(!Verdict::new(49.99, 50.0).over);
+        assert!(
+            Verdict::new(50.0, 50.0).over,
+            "spend == budget must be over"
+        );
+        assert!(Verdict::new(63.0, 50.0).over);
+    }
+
+    #[test]
+    fn verdict_remaining_is_signed_and_pct_scales() {
+        let under = Verdict::new(20.0, 50.0);
+        assert!((under.remaining - 30.0).abs() < 1e-9, "{}", under.remaining);
+        assert!((under.pct - 40.0).abs() < 1e-9, "{}", under.pct);
+
+        // Over budget, remaining goes negative; the summary prints `-remaining`
+        // as the "OVER by $X" amount, so the sign carries meaning.
+        let over = Verdict::new(60.0, 50.0);
+        assert!((over.remaining + 10.0).abs() < 1e-9, "{}", over.remaining);
+        assert!((over.pct - 120.0).abs() < 1e-9, "{}", over.pct);
+    }
+
+    #[test]
+    fn calendar_windows_use_local_day_week_and_month_boundaries() {
+        let now: Zoned = "2026-07-08T12:00:00-07:00[America/Los_Angeles]"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            window_bound_at("day", &now).unwrap(),
+            "2026-07-08T07:00:00Z"
+        );
+        assert_eq!(
+            window_bound_at("week", &now).unwrap(),
+            "2026-07-06T07:00:00Z"
+        );
+        assert_eq!(
+            window_bound_at("month", &now).unwrap(),
+            "2026-07-01T07:00:00Z"
+        );
+    }
+
+    #[test]
+    fn calendar_window_resolves_midnight_across_dst() {
+        let now: Zoned = "2026-03-09T12:00:00-07:00[America/Los_Angeles]"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            window_bound_at("week", &now).unwrap(),
+            "2026-03-09T07:00:00Z"
+        );
     }
 
     #[test]
@@ -238,5 +321,18 @@ mod tests {
         let (spent, unpriced) = sum_spend(&conn, &prices, "2026-07-15T00:00:00Z").unwrap();
         assert!((spent - 0.12).abs() < 1e-9, "spent was {spent}");
         assert_eq!(unpriced, 1);
+    }
+
+    #[test]
+    fn sum_propagates_bad_row_data() {
+        let conn = fixture();
+        let prices = PriceTable::load(std::path::Path::new("/definitely/not/here.json"));
+        conn.execute_batch(
+            "INSERT INTO calls VALUES
+                ('2026-07-20T10:00:00Z', 'gpt-x', 'not-an-integer', 50, 0, 0, 0.12);",
+        )
+        .unwrap();
+
+        assert!(sum_spend(&conn, &prices, "2026-07-15T00:00:00Z").is_err());
     }
 }

@@ -47,9 +47,9 @@ async fn main() -> anyhow::Result<()> {
             json,
         } => {
             // Distinct exit codes are the whole contract: 0 = under budget,
-            // 1 = at/over budget (the branchable signal), 2 = error. Keeping
-            // errors off code 1 means `check … || alert` never fires on a
-            // typo'd budget or a database problem.
+            // 1 = at/over budget (the branchable signal), 2 = error. Callers
+            // must inspect the exact status rather than treating every nonzero
+            // status as an over-budget verdict.
             let verdict = check::parse_budget(&budget).and_then(|(budget, period)| {
                 check::run(check::CheckOpts {
                     budget,

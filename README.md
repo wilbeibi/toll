@@ -133,8 +133,14 @@ window (`300/7d`, `20/24h`). turnpike won't send the alert for you — it's a me
 not a notifier — so hook it up to whatever already yells at you:
 
 ```zsh
-# quiet, exit-code only: fire your own notifier when over
-turnpike check --budget 50/day -q || ntfy send "LLM budget blown"
+# quiet, exit-code only: notify on 1; preserve errors such as 2
+turnpike check --budget 50/day -q
+check_status=$?
+if (( check_status == 1 )); then
+  ntfy send "LLM budget blown"
+elif (( check_status != 0 )); then
+  exit $check_status
+fi
 
 # a shell prompt segment, a cron/timer line, or a coding-agent hook can all
 # just run `turnpike check` and branch on the exit code
