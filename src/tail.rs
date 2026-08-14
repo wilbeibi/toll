@@ -1,6 +1,7 @@
+use crate::attr::{display_tool, unified_tool};
 use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
-use crate::record::{open_db, Usage};
+use crate::record::{has_column, open_db, Usage};
 use anyhow::Result;
 use rusqlite::params;
 
@@ -18,6 +19,8 @@ struct Row {
     error_kind: Option<String>,
     stored_cost: Option<f64>,
     client: Option<String>,
+    client_source: Option<String>,
+    peer_exe: Option<String>,
     endpoint: Option<String>,
     anomaly: Option<String>,
 }
@@ -38,16 +41,29 @@ pub fn run(n: usize, since: Option<String>, json: bool) -> Result<()> {
         None => String::new(),
     };
 
-    let mut stmt = conn.prepare(
+    // Readers never migrate (see stats.rs): appended attribution columns
+    // are selected behind a has_column guard so old DBs stay readable.
+    let src_col = if has_column(&conn, "client_source")? {
+        "client_source"
+    } else {
+        "NULL"
+    };
+    let exe_col = if has_column(&conn, "peer_exe")? {
+        "peer_exe"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT ts, provider, model, status, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
-                error_kind, cost, client, endpoint, anomaly
+                error_kind, cost, client, {exe_col} AS peer_exe,
+                {src_col} AS client_source, endpoint, anomaly
          FROM calls
          WHERE ts >= ?1
          ORDER BY rowid DESC
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+    ))?;
 
     let mut rows: Vec<Row> = stmt
         .query_map(params![lower, n as i64], |r| {
@@ -65,8 +81,10 @@ pub fn run(n: usize, since: Option<String>, json: bool) -> Result<()> {
                 error_kind: r.get(10)?,
                 stored_cost: r.get(11)?,
                 client: r.get(12)?,
-                endpoint: r.get(13)?,
-                anomaly: r.get(14)?,
+                peer_exe: r.get(13)?,
+                client_source: r.get(14)?,
+                endpoint: r.get(15)?,
+                anomaly: r.get(16)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -119,6 +137,13 @@ fn print_json_line(r: &Row, prices: &PriceTable) {
         "error_kind": r.error_kind,
         "anomaly": r.anomaly,
         "client": r.client,
+        "client_source": r.client_source,
+        "peer_exe": r.peer_exe,
+        "tool": unified_tool(
+            r.client.as_deref(),
+            r.client_source.as_deref(),
+            r.peer_exe.as_deref(),
+        ),
     });
     println!("{obj}");
 }
@@ -156,19 +181,23 @@ fn print_row(r: &Row, prices: &PriceTable) {
         .as_deref()
         .map(|a| format!(" ANOMALY={a}"))
         .unwrap_or_default();
-    let client = r
-        .client
-        .as_deref()
-        .map(|c| format!(" client={}", short_client(c)))
-        .unwrap_or_default();
+    // The unified attribution chain: declared header, else observed
+    // process, else the UA fallback — the same ranking as `stats --by-tool`.
+    let tool = unified_tool(
+        r.client.as_deref(),
+        r.client_source.as_deref(),
+        r.peer_exe.as_deref(),
+    )
+    .map(|t| format!(" tool={}", short_tool(&display_tool(&t))))
+    .unwrap_or_default();
     println!(
         "[{}] {} {} {} {}ms tokens={}{}{}{}{}{}",
-        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, anomaly, client,
+        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, anomaly, tool,
     );
 }
 
-/// First whitespace token of the raw client, bounded for one-line display.
-fn short_client(c: &str) -> String {
+/// First whitespace token of the tool label, bounded for one-line display.
+fn short_tool(c: &str) -> String {
     let tok = c.split_whitespace().next().unwrap_or(c);
     tok.chars().take(40).collect()
 }

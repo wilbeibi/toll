@@ -8,7 +8,7 @@ use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderMap, HeaderName, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use bytes::Bytes;
@@ -60,6 +60,10 @@ struct RecordBase {
     stream: bool,
     started: Instant,
     client: Option<String>,
+    /// Provenance of `client`: "header" (declared via x-turnpike-client) or
+    /// "ua" (User-Agent fallback). A `&'static str` because the vocabulary is
+    /// closed; read-time attribution ranks the two.
+    client_source: Option<&'static str>,
     /// Peer socket address, carried to the write task so the caller's process
     /// can be resolved off the forward path (invariant 2).
     peer: SocketAddr,
@@ -194,7 +198,12 @@ async fn handle_request(
     let model_from_path = (provider.model_from_path)(path);
 
     // Attribution is a passive read; the forwarded header set is unchanged.
-    let client = client_from_headers(&headers);
+    // Provenance rides along so read-time views can rank declared identity
+    // (header) over observed identity (peer_exe, then the UA fallback).
+    let (client, client_source) = match client_from_headers(&headers) {
+        Some((value, source)) => (Some(value), Some(source)),
+        None => (None, None),
+    };
 
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
@@ -267,6 +276,7 @@ async fn handle_request(
                     error_message: Some(message),
                     cost: None,
                     client,
+                    client_source: client_source.map(str::to_string),
                     endpoint: Some(endpoint.clone()),
                     anomaly: None,
                     raw_usage: None,
@@ -307,6 +317,7 @@ async fn handle_request(
         stream: is_sse,
         started: t0,
         client,
+        client_source,
         peer,
     };
 
@@ -704,6 +715,7 @@ fn record_from_base(
         error_message,
         cost: usage.cost,
         client: base.client.clone(),
+        client_source: base.client_source.map(str::to_string),
         endpoint: Some(base.endpoint.clone()),
         anomaly,
         raw_usage,
@@ -747,16 +759,25 @@ fn provider_from_host(headers: &HeaderMap, authority: Option<&str>) -> HostRoute
     }
 }
 
-/// Client identity for per-tool attribution: `x-turnpike-client` when the caller
-/// sets one, else the request `User-Agent`. `HeaderValue::to_str` only
-/// passes visible-ASCII values, so byte truncation cannot split a char.
-fn client_from_headers(headers: &HeaderMap) -> Option<String> {
-    let raw = headers
-        .get("x-turnpike-client")
-        .or_else(|| headers.get(header::USER_AGENT))?
-        .to_str()
-        .ok()?
-        .trim();
+/// Client identity for per-tool attribution: `x-turnpike-client` when the
+/// caller sets one, else the request `User-Agent`. Returns the value plus
+/// its provenance — "header" (declared) or "ua" (fallback) — because
+/// read-time attribution ranks declared identity over observed. A present
+/// but blank header yields `None` (no UA fallback), as before.
+fn client_from_headers(headers: &HeaderMap) -> Option<(String, &'static str)> {
+    if let Some(raw) = headers.get("x-turnpike-client") {
+        return normalize_client(raw).map(|s| (s, "header"));
+    }
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|raw| normalize_client(raw).map(|s| (s, "ua")))
+}
+
+/// Trim and byte-truncate one header value into a stored client string.
+/// `HeaderValue::to_str` only passes visible-ASCII values, so byte
+/// truncation cannot split a char.
+fn normalize_client(raw: &HeaderValue) -> Option<String> {
+    let raw = raw.to_str().ok()?.trim();
     if raw.is_empty() {
         return None;
     }
@@ -1057,16 +1078,16 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("user-agent", "node".parse().unwrap());
         h.insert("x-turnpike-client", "opencode".parse().unwrap());
-        assert_eq!(client_from_headers(&h).as_deref(), Some("opencode"));
+        assert_eq!(client_from_headers(&h), Some(("opencode".into(), "header")));
     }
 
     #[test]
-    fn client_falls_back_to_user_agent() {
+    fn client_falls_back_to_user_agent_with_ua_provenance() {
         let mut h = HeaderMap::new();
         h.insert("user-agent", "python-requests/2.32".parse().unwrap());
         assert_eq!(
-            client_from_headers(&h).as_deref(),
-            Some("python-requests/2.32")
+            client_from_headers(&h),
+            Some(("python-requests/2.32".into(), "ua"))
         );
     }
 
@@ -1077,8 +1098,16 @@ mod tests {
         assert_eq!(client_from_headers(&h), None);
         let long = "x".repeat(1000);
         h.insert("user-agent", long.parse().unwrap());
-        assert_eq!(client_from_headers(&h).unwrap().len(), MAX_CLIENT_BYTES);
+        assert_eq!(client_from_headers(&h).unwrap().0.len(), MAX_CLIENT_BYTES);
         assert_eq!(client_from_headers(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn blank_declared_header_does_not_fall_back_to_ua() {
+        let mut h = HeaderMap::new();
+        h.insert("x-turnpike-client", "".parse().unwrap());
+        h.insert("user-agent", "node".parse().unwrap());
+        assert_eq!(client_from_headers(&h), None);
     }
 
     #[test]

@@ -9,8 +9,8 @@ Turn turnpike's recorded facts into a spend report plus model-substitution sugge
 
 ## Data sources
 
-- `turnpike stats` / `turnpike tail` — first choice. Grouping: `--by-model | --by-client | --by-exe | --by-day`; filter `--since 30m|12h|7d|today|2026-07-01`; `--json` includes computed costs. Run `turnpike stats --help` for details.
-- `~/.local/share/turnpike/calls.db` — SQLite (WAL; read-only queries are safe), table `calls`. Key columns: `ts, provider, model, client, endpoint, peer_exe, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens, cost, raw_usage, anomaly`.
+- `turnpike stats` / `turnpike tail` — first choice. Grouping: `--by-model | --by-client | --by-exe | --by-tool | --by-day`; filter `--since 30m|12h|7d|today|2026-07-01`; `--json` includes computed costs. Run `turnpike stats --help` for details.
+- `~/.local/share/turnpike/calls.db` — SQLite (WAL; read-only queries are safe), table `calls`. Key columns: `ts, provider, model, client, client_source, endpoint, peer_exe, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens, cost, raw_usage, anomaly`.
 - `~/.local/share/turnpike/prices.json` — current rates. Refresh with `turnpike prices pull` before repricing anything.
 - Quality benchmarks: fetch live (models.dev API, Artificial Analysis, LMArena) — never rank model quality from memory; it stales in weeks.
 
@@ -21,10 +21,16 @@ Turn turnpike's recorded facts into a spend report plus model-substitution sugge
 3. Identify the task behind each expensive source. `client` (`x-turnpike-client: <tool>[:<task>]`) and `peer_exe` say *who*; if they don't reveal *what kind of work* (OCR / distillation / chat / coding), ask the user — never guess task type from token shape alone.
 4. Fetch current prices + benchmarks for candidate substitutes; recommend only same-task-class swaps, with estimated saving labeled "at current rates".
 
-Canonical drill-down (spend by source × model):
+Canonical drill-down (spend by source × model). The CASE is the same unified
+chain as `turnpike stats --by-tool` — declared header, else observed process,
+else the UA fallback:
 
 ```sql
-SELECT COALESCE(client, peer_exe, 'unknown') src, model,
+SELECT CASE
+         WHEN client_source = 'header' THEN COALESCE(client, 'unknown')
+         WHEN client_source = 'ua' THEN COALESCE(peer_exe, client, 'unknown')
+         ELSE COALESCE(client, peer_exe, 'unknown')
+       END src, model,
        COUNT(*) n, SUM(cost) spent,
        SUM(input_tokens) inp, SUM(cache_read_input_tokens) hit,
        SUM(output_tokens) out, SUM(reasoning_output_tokens) think
@@ -49,7 +55,7 @@ FROM g WHERE gap IS NOT NULL GROUP BY bucket ORDER BY MIN(gap);
 - **Cache accounting differs by provider.** OpenAI/DeepSeek/Gemini: `cache_read` is a *subset* of `input_tokens` (uncached = `input − cache_read`). Anthropic: cache fields are *additive* on top of `input_tokens`. Summing across providers without segmenting double-counts. `prices.json` records this per model as `cache_in_input`.
 - **Absent traffic ≠ zero spend.** Subscription tools (Claude Code, Codex) bypass turnpike. Raw `SUM(cost)` also undercounts calls where the provider reported no cost — prefer `turnpike stats`, which fills from the price table.
 - **Each machine has its own DB.** joi and mini run separate turnpike instances; a one-host query is a one-host answer. (mini: `ssh mini`, fish shell.)
-- **Older rows are sparser.** `raw_usage`, `client`, `peer_exe` were added over time and are NULL on early rows; typed token columns are the complete series.
+- **Older rows are sparser.** `raw_usage`, `client`, `peer_exe`, `client_source` were added over time and are NULL on early rows; typed token columns are the complete series. NULL `client_source` means the unified chain uses the historical client-then-process order, so pre-`client_source` rows may group differently than post-`client_source` rows of the same tool.
 - **A runtime UA names a runtime, not a tool.** Bare `node` / `python-requests` could be any script or harness (an eval runner fanning equal call-counts across models looks nothing like an agent). Corroborate with `peer_exe`, timestamps vs known runs, and the actual binary's shebang before attributing spend to a named tool — and treat equal-count multi-model bursts as one-shot evals, not recurring workload to optimize.
 
 ## Output contract
