@@ -72,11 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_keep_historical_coalesce_order() {
+    fn legacy_rows_prefer_client_over_process() {
         assert_eq!(
             unified_tool(Some("agent-x"), None, Some("/usr/bin/x")),
             Some("agent-x".into())
         );
+    }
+
+    #[test]
+    fn legacy_rows_use_process_without_client() {
         assert_eq!(
             unified_tool(None, None, Some("/usr/bin/x")),
             Some("/usr/bin/x".into())

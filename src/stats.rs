@@ -394,6 +394,16 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_pick_lower_median_on_even_lengths() {
+        // Nearest-rank on an even count takes the lower of the two middle
+        // elements: [100, 200] -> p50 = 100, [1,2,3,4] -> p50 = 2.
+        let mut two = vec![100, 200];
+        assert_eq!(percentiles(&mut two), (100, 200));
+        let mut four = vec![1, 2, 3, 4];
+        assert_eq!(percentiles(&mut four), (2, 4));
+    }
+
+    #[test]
     fn cache_pct_needs_positive_denominator() {
         assert_eq!(cache_pct(50, 100), Some(50.0));
         assert_eq!(cache_pct(0, 100), None);

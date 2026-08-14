@@ -1092,13 +1092,21 @@ mod tests {
     }
 
     #[test]
-    fn client_is_bounded_and_blank_is_none() {
+    fn blank_user_agent_is_none() {
         let mut h = HeaderMap::new();
         h.insert("user-agent", "  ".parse().unwrap());
         assert_eq!(client_from_headers(&h), None);
-        let long = "x".repeat(1000);
-        h.insert("user-agent", long.parse().unwrap());
+    }
+
+    #[test]
+    fn long_user_agent_is_truncated_to_bound() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "x".repeat(1000).parse().unwrap());
         assert_eq!(client_from_headers(&h).unwrap().0.len(), MAX_CLIENT_BYTES);
+    }
+
+    #[test]
+    fn no_client_headers_is_none() {
         assert_eq!(client_from_headers(&HeaderMap::new()), None);
     }
 

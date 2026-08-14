@@ -321,11 +321,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_connection_reset_is_client_not_connect() {
-        assert_eq!(
-            classify_error("connection reset by peer"),
-            "client_disconnect"
-        );
+    fn classify_error_kinds_and_ordering() {
+        // Covers every pattern family plus the ordering traps: a connection
+        // reset must classify as client_disconnect even though it contains
+        // "connect", and a refusal must reach upstream_connect.
+        for (message, kind) in [
+            ("tls handshake failed", "upstream_tls"),
+            ("request timed out", "upstream_timeout"),
+            ("connection reset by peer", "client_disconnect"),
+            ("broken pipe", "client_disconnect"),
+            ("connection refused", "upstream_connect"),
+            ("no route to host", "upstream_connect"),
+            ("unexplained failure", "other"),
+        ] {
+            assert_eq!(classify_error(message), kind, "{message:?}");
+        }
     }
 
     #[test]

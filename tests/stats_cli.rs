@@ -207,12 +207,14 @@ fn other_group_modes_still_run_on_full_schema() {
         Some("/usr/bin/node"),
     );
 
-    for args in [
-        vec!["--json"],
-        vec!["--by-model", "--json"],
-        vec!["--by-client", "--json"],
-        vec!["--by-exe", "--json"],
-        vec!["--by-day", "--json"],
+    // The widened SELECT must not disturb the pre-existing modes: each
+    // mode keeps its key, groups the single row, and counts it once.
+    for (args, key, want) in [
+        (vec!["--json"], "provider", "openai"),
+        (vec!["--by-model", "--json"], "model", "gpt-x"),
+        (vec!["--by-client", "--json"], "client", "opencode"),
+        (vec!["--by-exe", "--json"], "exe", "/usr/bin/node"),
+        (vec!["--by-day", "--json"], "day", "2026-08-01"),
     ] {
         let output = run_stats(&data, &args);
         assert!(
@@ -221,6 +223,8 @@ fn other_group_modes_still_run_on_full_schema() {
             String::from_utf8_lossy(&output.stderr)
         );
         let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 1, "{args:?}");
+        assert_eq!(rows[0][key], want, "{args:?}");
+        assert_eq!(rows[0]["calls"], 1, "{args:?}");
     }
 }

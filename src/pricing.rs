@@ -370,9 +370,9 @@ mod tests {
     fn deepseek_cache_in_input_true() {
         let u = usage(100_000, 1_000, 80_000, 0);
         let cost = table().compute(Some("deepseek-v4-pro"), &u).unwrap();
-        // non-cached = 20k * 0.27/M + cache_read 80k * 0.07/M + output 1k * 1.10/M
-        let expected = 20_000.0 / 1e6 * 0.27 + 80_000.0 / 1e6 * 0.07 + 1_000.0 / 1e6 * 1.10;
-        assert!((cost - expected).abs() < 1e-9);
+        // Hand-derived: non-cached 20k * 0.27/M + cache_read 80k * 0.07/M
+        // + output 1k * 1.10/M = 0.0054 + 0.0056 + 0.0011.
+        assert!((cost - 0.0121).abs() < 1e-12);
     }
 
     #[test]
@@ -380,11 +380,9 @@ mod tests {
         // input_tokens = non-cached only; cache is additive
         let u = usage(80_000, 50_000, 20_000, 5_000);
         let cost = table().compute(Some("claude-sonnet-4-5"), &u).unwrap();
-        let expected = 80_000.0 / 1e6 * 3.0
-            + 20_000.0 / 1e6 * 0.3
-            + 5_000.0 / 1e6 * 3.75
-            + 50_000.0 / 1e6 * 15.0;
-        assert!((cost - expected).abs() < 1e-9);
+        // Hand-derived: 80k * 3.0/M + 20k * 0.3/M + 5k * 3.75/M + 50k * 15.0/M
+        // = 0.24 + 0.006 + 0.01875 + 0.75.
+        assert!((cost - 1.01475).abs() < 1e-12);
     }
 
     fn tiered_table() -> PriceTable {
@@ -403,8 +401,8 @@ mod tests {
     fn context_tier_below_threshold_uses_base_rates() {
         let u = usage(100_000, 1_000, 0, 0);
         let cost = tiered_table().compute(Some("grok-4.3"), &u).unwrap();
-        let expected = 100_000.0 / 1e6 * 1.25 + 1_000.0 / 1e6 * 2.5;
-        assert!((cost - expected).abs() < 1e-9);
+        // Hand-derived: 100k * 1.25/M + 1k * 2.5/M = 0.125 + 0.0025.
+        assert!((cost - 0.1275).abs() < 1e-12);
     }
 
     #[test]
@@ -416,12 +414,15 @@ mod tests {
             "MiniMax-M2.1":   {"input_per_m":0.0,"output_per_m":0.0,"cache_in_input":true},
             "minimax-m2.1":   {"input_per_m":0.3,"output_per_m":1.2,"cache_in_input":true}
         }"#;
+        // Many loads on purpose: the bug was per-process HashMap
+        // iteration order, so one load catches a regression only half the
+        // time — twenty make it effectively certain.
         for _ in 0..20 {
             let t = PriceTable::from_json(json).unwrap();
             let u = usage(1_000, 100, 0, 0);
             let cost = t.compute(Some("minimax-m2.1"), &u).unwrap();
-            let expected = 1_000.0 / 1e6 * 0.3 + 100.0 / 1e6 * 1.2;
-            assert!((cost - expected).abs() < 1e-12);
+            // Hand-derived: 1k * 0.3/M + 100 * 1.2/M = 0.0003 + 0.00012.
+            assert!((cost - 0.00042).abs() < 1e-12);
         }
     }
 
@@ -457,7 +458,7 @@ mod tests {
         // just the 50k overflow. This is the bug the flat table mispriced.
         let u = usage(250_000, 1_000, 0, 0);
         let cost = tiered_table().compute(Some("grok-4.3"), &u).unwrap();
-        let expected = 250_000.0 / 1e6 * 2.5 + 1_000.0 / 1e6 * 5.0;
-        assert!((cost - expected).abs() < 1e-9);
+        // Hand-derived: 250k * 2.5/M + 1k * 5.0/M = 0.625 + 0.005.
+        assert!((cost - 0.63).abs() < 1e-12);
     }
 }
