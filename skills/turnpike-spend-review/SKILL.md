@@ -16,7 +16,7 @@ Turn turnpike's recorded facts into a spend report plus model-substitution sugge
 
 ## Workflow
 
-1. `turnpike prices pull`, then survey: `turnpike stats --since 30d --json`, then `--by-exe`, `--by-client`, `--by-model` to find the dominant source × model pairs.
+1. `turnpike prices pull`, then survey: `turnpike stats --since 30d --json`, then `--by-tool` (the same unified chain as the drill-down below), corroborated with `--by-exe`/`--by-client`, to find the dominant source × model pairs.
 2. Drill into the top pairs with SQL (below). Segment by provider before summing anything (see traps).
 3. Identify the task behind each expensive source. `client` (`x-turnpike-client: <tool>[:<task>]`) and `peer_exe` say *who*; if they don't reveal *what kind of work* (OCR / distillation / chat / coding), ask the user — never guess task type from token shape alone.
 4. Fetch current prices + benchmarks for candidate substitutes; recommend only same-task-class swaps, with estimated saving labeled "at current rates".
