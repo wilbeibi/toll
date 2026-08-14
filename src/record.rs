@@ -79,6 +79,13 @@ pub struct Record {
     /// what the caller *declared*.
     #[serde(default)]
     pub peer_exe: Option<String>,
+    /// Provenance of `client`: `"header"` when it came from
+    /// `x-turnpike-client` (identity the caller *declared*), `"ua"` when it
+    /// is the `User-Agent` fallback. Read-time attribution ranks the two;
+    /// `None` on rows written before this column existed (legacy order:
+    /// client, else peer_exe).
+    #[serde(default)]
+    pub client_source: Option<String>,
 }
 
 pub struct Store {
@@ -136,7 +143,8 @@ impl Store {
                 endpoint                    TEXT,
                 anomaly                     TEXT,
                 raw_usage                   TEXT,
-                peer_exe                    TEXT
+                peer_exe                    TEXT,
+                client_source               TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ts       ON calls(ts);
             CREATE INDEX IF NOT EXISTS idx_provider ON calls(provider);
@@ -149,6 +157,7 @@ impl Store {
         self.add_column("ALTER TABLE calls ADD COLUMN anomaly TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN raw_usage TEXT")?;
         self.add_column("ALTER TABLE calls ADD COLUMN peer_exe TEXT")?;
+        self.add_column("ALTER TABLE calls ADD COLUMN client_source TEXT")?;
         Ok(())
     }
 
@@ -171,8 +180,8 @@ impl Store {
                 cache_read_input_tokens, cache_creation_input_tokens,
                 reasoning_output_tokens,
                 error_kind, error_message, cost, client, endpoint, anomaly, raw_usage,
-                peer_exe
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                peer_exe, client_source
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 r.id,
                 r.ts,
@@ -195,6 +204,7 @@ impl Store {
                 r.anomaly,
                 r.raw_usage,
                 r.peer_exe,
+                r.client_source,
             ],
         )?;
         Ok(())
@@ -212,6 +222,15 @@ pub fn open_db(path: &Path) -> Result<Connection> {
          PRAGMA busy_timeout=5000;",
     )?;
     Ok(conn)
+}
+
+/// Whether the `calls` table has `col`. Read paths (stats/tail) never
+/// migrate, so a column appended after a reader's DB was created must be
+/// referenced behind this guard — old databases stay readable (invariant 4).
+pub fn has_column(conn: &Connection, col: &str) -> Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM pragma_table_info('calls') WHERE name = ?1")?
+        .exists([col])?)
 }
 
 const ERROR_PATTERNS: &[(&str, &[&str])] = &[
@@ -261,7 +280,7 @@ impl Store {
                         cache_read_input_tokens, cache_creation_input_tokens,
                         reasoning_output_tokens,
                         error_kind, error_message, cost, client, endpoint, anomaly, raw_usage,
-                        peer_exe
+                        peer_exe, client_source
                  FROM calls WHERE id = ?1",
                 [id],
                 |row| {
@@ -289,6 +308,7 @@ impl Store {
                         anomaly: row.get(18)?,
                         raw_usage: row.get(19)?,
                         peer_exe: row.get(20)?,
+                        client_source: row.get(21)?,
                     })
                 },
             )
@@ -301,11 +321,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_connection_reset_is_client_not_connect() {
-        assert_eq!(
-            classify_error("connection reset by peer"),
-            "client_disconnect"
-        );
+    fn classify_error_kinds_and_ordering() {
+        // Covers every pattern family plus the ordering traps: a connection
+        // reset must classify as client_disconnect even though it contains
+        // "connect", and a refusal must reach upstream_connect.
+        for (message, kind) in [
+            ("tls handshake failed", "upstream_tls"),
+            ("request timed out", "upstream_timeout"),
+            ("connection reset by peer", "client_disconnect"),
+            ("broken pipe", "client_disconnect"),
+            ("connection refused", "upstream_connect"),
+            ("no route to host", "upstream_connect"),
+            ("unexplained failure", "other"),
+        ] {
+            assert_eq!(classify_error(message), kind, "{message:?}");
+        }
     }
 
     #[test]
@@ -361,6 +391,7 @@ mod tests {
             anomaly: None,
             raw_usage: Some(r#"{"prompt_tokens":50,"completion_tokens":25}"#.into()),
             peer_exe: Some("/usr/bin/test-tool".into()),
+            client_source: Some("header".into()),
         }
     }
 
@@ -395,6 +426,7 @@ mod tests {
         assert_eq!(back.anomaly, rec.anomaly);
         assert_eq!(back.raw_usage, rec.raw_usage);
         assert_eq!(back.peer_exe, rec.peer_exe);
+        assert_eq!(back.client_source, rec.client_source);
     }
 
     #[test]
@@ -423,6 +455,21 @@ mod tests {
         // The newest appended column must also forward-migrate onto a DB
         // created before it existed (invariant 4).
         assert_eq!(back.peer_exe.as_deref(), Some("/usr/bin/test-tool"));
+        assert_eq!(back.client_source.as_deref(), Some("header"));
+    }
+
+    #[test]
+    fn has_column_reports_schema_state() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(has_column(&store.conn, "client_source").unwrap());
+        assert!(has_column(&store.conn, "peer_exe").unwrap());
+        assert!(!has_column(&store.conn, "does_not_exist").unwrap());
+
+        // A table created by an older build lacks appended columns entirely.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE calls (id TEXT PRIMARY KEY)")
+            .unwrap();
+        assert!(!has_column(&conn, "client_source").unwrap());
     }
 
     #[test]

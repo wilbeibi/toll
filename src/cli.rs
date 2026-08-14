@@ -28,8 +28,13 @@ pub enum Command {
 
         /// Group by resolved calling process (peer_exe; Linux-only, else every
         /// row is unknown).
-        #[arg(long, conflicts_with_all = ["by_model", "by_client", "by_day"])]
+        #[arg(long, conflicts_with_all = ["by_model", "by_client", "by_day", "by_tool"])]
         by_exe: bool,
+
+        /// Group by best tool identity per row: declared x-turnpike-client
+        /// header, else observed process (peer_exe), else User-Agent.
+        #[arg(long, conflicts_with_all = ["by_model", "by_client", "by_day", "by_exe"])]
+        by_tool: bool,
 
         /// Only include calls at or after this point: 30m, 12h, 7d, today,
         /// a date (2026-07-01), or an RFC-3339 instant.

@@ -1,6 +1,7 @@
+use crate::attr::{display_tool, unified_tool};
 use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
-use crate::record::open_db;
+use crate::record::{has_column, open_db};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,6 +11,7 @@ pub struct StatsOpts {
     pub by_client: bool,
     pub by_day: bool,
     pub by_exe: bool,
+    pub by_tool: bool,
     pub since: Option<String>,
     pub json: bool,
 }
@@ -39,7 +41,11 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     let conn = open_db(&path)?;
     let prices = PriceTable::load(&prices_json());
 
-    // col/key_label are always one of five known literal pairs, never user input.
+    // col/key_label are always one of six known literal expressions, never
+    // user input. The by_tool arm selects a placeholder: its key is computed
+    // per-row in Rust below from the three attribution columns. The
+    // placeholder must be non-NULL so rows with no attribution at all still
+    // flow through instead of being dropped by the row mapper.
     let (col, key_label) = if opts.by_model {
         ("COALESCE(model, 'unknown')", "model")
     } else if opts.by_client {
@@ -48,6 +54,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         ("substr(ts, 1, 10)", "day")
     } else if opts.by_exe {
         ("COALESCE(peer_exe, 'unknown')", "exe")
+    } else if opts.by_tool {
+        ("''", "tool")
     } else {
         ("provider", "provider")
     };
@@ -58,8 +66,23 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         None => String::new(),
     };
 
+    // Readers never migrate, so columns appended after a DB was created are
+    // selected behind a has_column guard (NULL stands in, keeping old DBs
+    // readable; the unified chain treats NULL source as legacy precedence).
+    let src_col = if has_column(&conn, "client_source")? {
+        "client_source"
+    } else {
+        "NULL"
+    };
+    let exe_col = if has_column(&conn, "peer_exe")? {
+        "peer_exe"
+    } else {
+        "NULL"
+    };
+
     let sql = format!(
         "SELECT {col} as grp, model,
+                client, {src_col} AS client_source, {exe_col} AS peer_exe,
                 COALESCE(input_tokens, 0),
                 COALESCE(output_tokens, 0),
                 COALESCE(cache_read_input_tokens, 0),
@@ -80,20 +103,51 @@ pub fn run(opts: StatsOpts) -> Result<()> {
 
     let rows = stmt.query_map([&lower], |r| {
         Ok((
-            r.get::<_, String>(0)?,         // group key
+            r.get::<_, String>(0)?,         // group key (placeholder for by_tool)
             r.get::<_, Option<String>>(1)?, // model (for price lookup)
-            r.get::<_, i64>(2)?,            // input_tokens
-            r.get::<_, i64>(3)?,            // output_tokens
-            r.get::<_, i64>(4)?,            // cache_read
-            r.get::<_, i64>(5)?,            // cache_creation
-            r.get::<_, Option<f64>>(6)?,    // stored cost (provider-reported)
-            r.get::<_, bool>(7)?,           // is_error (transport or HTTP >= 400)
-            r.get::<_, i64>(8)?,            // latency_ms
+            r.get::<_, Option<String>>(2)?, // client
+            r.get::<_, Option<String>>(3)?, // client_source
+            r.get::<_, Option<String>>(4)?, // peer_exe
+            r.get::<_, i64>(5)?,            // input_tokens
+            r.get::<_, i64>(6)?,            // output_tokens
+            r.get::<_, i64>(7)?,            // cache_read
+            r.get::<_, i64>(8)?,            // cache_creation
+            r.get::<_, Option<f64>>(9)?,    // stored cost (provider-reported)
+            r.get::<_, bool>(10)?,          // is_error (transport or HTTP >= 400)
+            r.get::<_, i64>(11)?,           // latency_ms
         ))
     })?;
 
     for row in rows.filter_map(|r| r.ok()) {
-        let (grp, model, input, output, cache_read, cache_write, stored_cost, is_error, lat) = row;
+        let (
+            grp,
+            model,
+            client,
+            client_source,
+            peer_exe,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            stored_cost,
+            is_error,
+            lat,
+        ) = row;
+
+        // --by-tool groups on the unified attribution chain computed here in
+        // Rust (single implementation, shared with tail); its SQL grp
+        // placeholder is ignored.
+        let key = if opts.by_tool {
+            unified_tool(
+                client.as_deref(),
+                client_source.as_deref(),
+                peer_exe.as_deref(),
+            )
+            .unwrap_or("unknown")
+            .to_string()
+        } else {
+            grp
+        };
 
         let usage = crate::cost::usage_from_counts(input, output, cache_read, cache_write);
         let call_cost = match crate::cost::call_cost(&prices, model.as_deref(), stored_cost, &usage)
@@ -119,8 +173,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             input + cache_read + cache_write
         };
 
-        let e = groups.entry(grp.clone()).or_insert(Agg {
-            key: grp,
+        let e = groups.entry(key.clone()).or_insert(Agg {
+            key,
             calls: 0,
             input: 0,
             output: 0,
@@ -152,7 +206,14 @@ pub fn run(opts: StatsOpts) -> Result<()> {
     if opts.json {
         print_json(key_label, &mut groups);
     } else {
-        print_table(key_label, &mut groups);
+        // Full keys group; only the table display shortens them —
+        // basename for paths, then the usual 48-char bound.
+        let display: fn(&str) -> String = if opts.by_tool {
+            |k| display_key(&display_tool(k))
+        } else {
+            display_key
+        };
+        print_table(key_label, &mut groups, display);
     }
 
     if unpriced_calls > 0 {
@@ -204,7 +265,7 @@ fn print_json(key_label: &str, groups: &mut BTreeMap<String, Agg>) {
     );
 }
 
-fn print_table(key_label: &str, groups: &mut BTreeMap<String, Agg>) {
+fn print_table(key_label: &str, groups: &mut BTreeMap<String, Agg>, display: fn(&str) -> String) {
     let has_cache_write = groups.values().any(|r| r.cache_write > 0);
 
     // Client keys are raw User-Agent strings and can be long; group on the
@@ -235,7 +296,7 @@ fn print_table(key_label: &str, groups: &mut BTreeMap<String, Agg>) {
         cols.push(p95.to_string());
         cols.push(format!("{:.4}", a.cost));
         shown.push(Shown {
-            key: display_key(&a.key),
+            key: display(&a.key),
             cols,
         });
     }
@@ -331,6 +392,16 @@ mod tests {
         assert_eq!(percentiles(&mut lats), (300, 1000));
         let mut one = vec![42];
         assert_eq!(percentiles(&mut one), (42, 42));
+    }
+
+    #[test]
+    fn percentiles_pick_lower_median_on_even_lengths() {
+        // Nearest-rank on an even count takes the lower of the two middle
+        // elements: [100, 200] -> p50 = 100, [1,2,3,4] -> p50 = 2.
+        let mut two = vec![100, 200];
+        assert_eq!(percentiles(&mut two), (100, 200));
+        let mut four = vec![1, 2, 3, 4];
+        assert_eq!(percentiles(&mut four), (2, 4));
     }
 
     #[test]

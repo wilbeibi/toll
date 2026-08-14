@@ -107,9 +107,16 @@ Then read back what you used:
 turnpike tail -n 10 --since 2h
 turnpike stats --since 7d
 turnpike stats --by-model
-turnpike stats --by-client     # which tool spent it
+turnpike stats --by-client     # which declared client spent it
+turnpike stats --by-tool       # best identity per call: declared header,
+                              #   else observed process (peer_exe), else User-Agent
 turnpike stats --by-day        # daily trend
 ```
+
+`--by-tool` groups each call under its single best tool identity — the declared
+`x-turnpike-client` header when the caller sends one, otherwise the observed calling
+process (`peer_exe`), falling back to the `User-Agent`. Old rows (before `client_source`
+existed) keep the historical client-then-process order.
 
 Add `--json` to `stats` or `tail` for machine-readable output.
 

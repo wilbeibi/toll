@@ -65,18 +65,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relative_hours_is_in_the_past_and_utc() {
-        let bound = lower_bound("2h").unwrap();
-        let now = Timestamp::now().to_string();
-        assert!(bound < now, "{bound} should sort before {now}");
-        assert!(bound.ends_with('Z'));
+    fn relative_hours_is_about_two_hours_in_the_past_and_utc() {
+        let bound_str = lower_bound("2h").unwrap();
+        assert!(bound_str.ends_with('Z'));
+        let bound: Timestamp = bound_str.parse().unwrap();
+        let delta = Timestamp::now() - bound;
+        // ~120 minutes behind now; [118, 122] absorbs execution jitter.
+        let low = Span::new().try_minutes(118).unwrap();
+        let high = Span::new().try_minutes(122).unwrap();
+        assert!(
+            delta.compare(low).unwrap() != std::cmp::Ordering::Less
+                && delta.compare(high).unwrap() != std::cmp::Ordering::Greater,
+            "bound was {bound_str}"
+        );
     }
 
     #[test]
-    fn relative_days_parse() {
-        // Days are calendar units; must go through Zoned, not Timestamp.
-        assert!(lower_bound("7d").is_ok());
-        assert!(lower_bound("30m").is_ok());
+    fn relative_spans_order_monotonically() {
+        // 7d is farther in the past than 6d, which is farther than 2h,
+        // which is farther than 30m. Unit confusion (parsing days as
+        // minutes, say) breaks this order even when the value is_ok.
+        let d7 = lower_bound("7d").unwrap();
+        let d6 = lower_bound("6d").unwrap();
+        let h2 = lower_bound("2h").unwrap();
+        let m30 = lower_bound("30m").unwrap();
+        assert!(d7 < d6 && d6 < h2 && h2 < m30, "{d7} < {d6} < {h2} < {m30}");
     }
 
     #[test]

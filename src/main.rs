@@ -1,3 +1,4 @@
+mod attr;
 mod check;
 mod cli;
 mod config;
@@ -30,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
             by_client,
             by_day,
             by_exe,
+            by_tool,
             since,
             json,
         } => stats::run(stats::StatsOpts {
@@ -37,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
             by_client,
             by_day,
             by_exe,
+            by_tool,
             since,
             json,
         })?,
