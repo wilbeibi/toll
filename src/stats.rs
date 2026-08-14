@@ -143,7 +143,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
                 client_source.as_deref(),
                 peer_exe.as_deref(),
             )
-            .unwrap_or_else(|| "unknown".into())
+            .unwrap_or("unknown")
+            .to_string()
         } else {
             grp
         };

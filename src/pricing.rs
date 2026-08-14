@@ -90,13 +90,13 @@ impl PriceTable {
         let mut map = HashMap::with_capacity(raw.len());
         for k in keys {
             let rates = &raw[k];
-            let replace = match map.get(&k.to_ascii_lowercase()) {
-                None => true,
-                Some(cur) => has_real_rates(rates) && !has_real_rates(cur),
-            };
-            if replace {
-                map.insert(k.to_ascii_lowercase(), rates.clone());
-            }
+            map.entry(k.to_ascii_lowercase())
+                .and_modify(|cur: &mut Rates| {
+                    if has_real_rates(rates) && !has_real_rates(cur) {
+                        *cur = rates.clone();
+                    }
+                })
+                .or_insert_with(|| rates.clone());
         }
         Ok(Self { map })
     }

@@ -15,15 +15,18 @@
 /// - `client_source == NULL` (legacy rows) → `client`, else `peer_exe`
 ///   (the historical COALESCE order)
 /// - all absent → `None`; callers render "unknown"
-pub fn unified_tool(
-    client: Option<&str>,
+///
+/// Borrowed from its inputs — a pure selector, no allocation; callers
+/// own a copy only where they need one (grouping keys).
+pub fn unified_tool<'a>(
+    client: Option<&'a str>,
     client_source: Option<&str>,
-    peer_exe: Option<&str>,
-) -> Option<String> {
+    peer_exe: Option<&'a str>,
+) -> Option<&'a str> {
     match client_source {
-        Some("header") => client.map(str::to_string),
-        Some("ua") => peer_exe.or(client).map(str::to_string),
-        _ => client.or(peer_exe).map(str::to_string),
+        Some("header") => client,
+        Some("ua") => peer_exe.or(client),
+        _ => client.or(peer_exe),
     }
 }
 
@@ -50,7 +53,7 @@ mod tests {
     fn header_provenance_picks_declared_client() {
         assert_eq!(
             unified_tool(Some("opencode"), Some("header"), Some("/usr/bin/node")),
-            Some("opencode".into())
+            Some("opencode")
         );
     }
 
@@ -59,7 +62,7 @@ mod tests {
         // A bare runtime UA like "node" loses to the resolved executable.
         assert_eq!(
             unified_tool(Some("node"), Some("ua"), Some("/usr/bin/python")),
-            Some("/usr/bin/python".into())
+            Some("/usr/bin/python")
         );
     }
 
@@ -67,7 +70,7 @@ mod tests {
     fn ua_provenance_falls_back_to_client_without_exe() {
         assert_eq!(
             unified_tool(Some("curl/8.5.0"), Some("ua"), None),
-            Some("curl/8.5.0".into())
+            Some("curl/8.5.0")
         );
     }
 
@@ -75,7 +78,7 @@ mod tests {
     fn legacy_rows_prefer_client_over_process() {
         assert_eq!(
             unified_tool(Some("agent-x"), None, Some("/usr/bin/x")),
-            Some("agent-x".into())
+            Some("agent-x")
         );
     }
 
@@ -83,7 +86,7 @@ mod tests {
     fn legacy_rows_use_process_without_client() {
         assert_eq!(
             unified_tool(None, None, Some("/usr/bin/x")),
-            Some("/usr/bin/x".into())
+            Some("/usr/bin/x")
         );
     }
 

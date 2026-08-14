@@ -159,7 +159,7 @@ fn print_row(r: &Row, prices: &PriceTable) {
         (Some(i), None) => format!("{i}→?"),
         _ => "?".into(),
     };
-    let cache_hit = r.cache_read.map(|n| n > 0).unwrap_or(false);
+    let cache_hit = r.cache_read.is_some_and(|n| n > 0);
     let cache = if cache_hit {
         format!(" cache_read={}", r.cache_read.unwrap_or(0))
     } else {
@@ -188,7 +188,7 @@ fn print_row(r: &Row, prices: &PriceTable) {
         r.client_source.as_deref(),
         r.peer_exe.as_deref(),
     )
-    .map(|t| format!(" tool={}", short_tool(&display_tool(&t))))
+    .map(|t| format!(" tool={}", short_tool(&display_tool(t))))
     .unwrap_or_default();
     println!(
         "[{}] {} {} {} {}ms tokens={}{}{}{}{}{}",
