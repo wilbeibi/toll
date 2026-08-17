@@ -70,6 +70,12 @@ pub struct PriceTable {
     map: HashMap<String, Rates>,
 }
 
+/// A key in the form `pull` writes: already lowercase, so it is the entry the
+/// canonical-provider pass produced rather than a legacy mixed-case re-listing.
+fn is_canonical_key(k: &str) -> bool {
+    !k.bytes().any(|b| b.is_ascii_uppercase())
+}
+
 /// A listing that actually charges for tokens: nonzero input or output rate.
 fn has_real_rates(r: &Rates) -> bool {
     r.input_per_m > 0.0 || r.output_per_m > 0.0
@@ -80,23 +86,35 @@ impl PriceTable {
         let raw: HashMap<String, Rates> = serde_json::from_str(json)?;
         // Lowercased keys can collide across listings ("Qwen/..." vs
         // "qwen/..." for the same model). HashMap iteration order is random
-        // per process, so resolve collisions deterministically: a listing
-        // with real (nonzero input or output) rates beats a free listing —
-        // pricing token-bearing calls at a confident $0 would silently
-        // underreport spend — and among equals the lexicographically
-        // smaller original key wins.
+        // per process, so collisions are resolved by an explicit preference,
+        // best first, and the first insertion wins:
+        //
+        //   1. A listing with real (nonzero input or output) rates beats a
+        //      free one — pricing token-bearing calls at a confident $0 would
+        //      silently under-report spend.
+        //   2. A key already in canonical form (equal to its own lowercase)
+        //      beats a mixed-case one. `pull` lowercases every key it writes
+        //      and inserts canonical providers first, so the canonical-form
+        //      key *is* the entry a current pull produced; a mixed-case
+        //      sibling is a legacy re-listing from a reseller, whose rates
+        //      differ from the provider's own. Without this, `DeepSeek-V4-Pro`
+        //      (a reseller at 0.4286/0.8571, no cache rate) outranked
+        //      `deepseek-v4-pro` (DeepSeek's own 0.435/0.87/0.003625) on
+        //      nothing but `'D' < 'd'`.
+        //   3. Among equals, the lexicographically smaller key — so two loads
+        //      can never disagree.
         let mut keys: Vec<&String> = raw.keys().collect();
-        keys.sort();
+        keys.sort_by(|a, b| {
+            let rank = |k: &String| {
+                // false sorts first, so negate the "better" predicates.
+                (!has_real_rates(&raw[k]), !is_canonical_key(k))
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
         let mut map = HashMap::with_capacity(raw.len());
         for k in keys {
-            let rates = &raw[k];
             map.entry(k.to_ascii_lowercase())
-                .and_modify(|cur: &mut Rates| {
-                    if has_real_rates(rates) && !has_real_rates(cur) {
-                        *cur = rates.clone();
-                    }
-                })
-                .or_insert_with(|| rates.clone());
+                .or_insert_with(|| raw[k].clone());
         }
         Ok(Self { map })
     }
@@ -427,17 +445,48 @@ mod tests {
     }
 
     #[test]
-    fn collision_among_equal_listings_picks_smaller_key() {
-        // Both variants are paid: the lexicographically smaller original key
-        // wins, so two loads can never disagree.
+    fn collision_prefers_the_canonical_lowercase_listing() {
+        // Both variants are paid, so rule 1 cannot separate them. The
+        // already-lowercase key is the one a current `pull` writes; the
+        // mixed-case sibling is a legacy reseller re-listing. Picking by raw
+        // lexicographic order instead made `DeepSeek-V4-Pro` (0.4286, no
+        // cache rate) beat DeepSeek's own `deepseek-v4-pro` (0.435/0.003625)
+        // on nothing but `'D' < 'd'`, mispricing a month of real calls.
         let json = r#"{
             "a-model": {"input_per_m":1.0,"output_per_m":1.0,"cache_in_input":true},
             "A-Model": {"input_per_m":2.0,"output_per_m":2.0,"cache_in_input":true}
         }"#;
         for _ in 0..20 {
             let t = PriceTable::from_json(json).unwrap();
-            // "A-Model" < "a-model", so the uppercase listing's rates win.
-            assert_eq!(t.lookup("a-model").unwrap().input_per_m, 2.0);
+            assert_eq!(t.lookup("a-model").unwrap().input_per_m, 1.0);
+        }
+    }
+
+    #[test]
+    fn collision_among_equally_canonical_listings_is_stable() {
+        // Neither key is lowercase, so rule 2 cannot separate them either:
+        // the lexicographically smaller one wins, and every load agrees.
+        let json = r#"{
+            "B-Model": {"input_per_m":1.0,"output_per_m":1.0,"cache_in_input":true},
+            "B-MODEL": {"input_per_m":2.0,"output_per_m":2.0,"cache_in_input":true}
+        }"#;
+        for _ in 0..20 {
+            let t = PriceTable::from_json(json).unwrap();
+            // "B-MODEL" < "B-Model" ('O' < 'o').
+            assert_eq!(t.lookup("b-model").unwrap().input_per_m, 2.0);
+        }
+    }
+
+    #[test]
+    fn free_listing_never_beats_a_paid_one_even_when_canonical() {
+        // Rule 1 outranks rule 2: a confident $0 would silently under-report.
+        let json = r#"{
+            "c-model": {"input_per_m":0.0,"output_per_m":0.0,"cache_in_input":true},
+            "C-Model": {"input_per_m":3.0,"output_per_m":3.0,"cache_in_input":true}
+        }"#;
+        for _ in 0..20 {
+            let t = PriceTable::from_json(json).unwrap();
+            assert_eq!(t.lookup("c-model").unwrap().input_per_m, 3.0);
         }
     }
 
