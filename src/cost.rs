@@ -5,6 +5,7 @@
 
 use crate::pricing::PriceTable;
 use crate::record::Usage;
+use jiff::Timestamp;
 
 /// Build a `Usage` for cost accounting from the four token columns as they are
 /// stored (`i64`, `0` meaning absent). `cost` is deliberately left `None` so
@@ -20,8 +21,17 @@ pub fn usage_from_counts(input: i64, output: i64, cache_read: i64, cache_write: 
     }
 }
 
+/// The instant a stored row was recorded, for selecting the price revision in
+/// force when the call was made. A row whose `ts` will not parse is priced at
+/// current rates: unparseable is corruption, and today's table is the best
+/// available guess.
+pub fn priced_at(ts: &str) -> Timestamp {
+    ts.parse().unwrap_or_else(|_| Timestamp::now())
+}
+
 /// The billable cost of one call. Prefer the provider-reported `stored` cost;
-/// otherwise price the tokens from the local table.
+/// otherwise price the tokens from the local table *as of `at`*, so a provider
+/// price change does not retroactively reprice already-recorded calls.
 ///
 /// `None` means the call carried tokens but no price was found — the caller
 /// decides how to surface that, and it must **not** be summed as a confident
@@ -32,11 +42,12 @@ pub fn call_cost(
     model: Option<&str>,
     stored: Option<f64>,
     usage: &Usage,
+    at: Timestamp,
 ) -> Option<f64> {
     if let Some(c) = stored {
         return Some(c);
     }
-    if let Some(c) = prices.compute(model, usage) {
+    if let Some(c) = prices.compute(model, usage, at) {
         return Some(c);
     }
     if usage.input_tokens.is_some() || usage.output_tokens.is_some() {

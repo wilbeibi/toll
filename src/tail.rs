@@ -114,7 +114,12 @@ fn cost_of(r: &Row, prices: &PriceTable) -> (Option<f64>, &'static str) {
         cache_creation_input_tokens: r.cache_creation,
         ..Default::default()
     };
-    (prices.compute(r.model.as_deref(), &usage), "computed")
+    // Priced at the row's own timestamp so an old call keeps the price it was
+    // billed at after the provider changes rates.
+    (
+        prices.compute(r.model.as_deref(), &usage, crate::cost::priced_at(&r.ts)),
+        "computed",
+    )
 }
 
 /// One JSON object per line (JSONL) — grep/jq friendly for consumers.
