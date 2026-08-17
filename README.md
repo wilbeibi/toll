@@ -201,11 +201,17 @@ turnpike prices show    # what's loaded, and which models changed price
 ```
 
 Every call is priced at the rates in force **when it was made**, not at today's
-rates. `prices pull` never overwrites: when an upstream price moves, it appends
-a dated revision, so old rows keep the price you actually paid and a provider's
-increase doesn't retroactively rewrite last month. It stamps the revision with
-the pull time — if you know the real date, edit `effective_from` in
-`prices.json` and the next pull will leave it alone.
+rates. When an upstream price moves, `prices pull` appends a dated revision
+rather than replacing what's there, so old rows keep the price you actually
+paid and a provider's increase doesn't retroactively rewrite last month. It
+stamps the revision with the pull time — if you know the real date, edit
+`effective_from` in `prices.json` and the next pull will leave it alone.
+
+That makes `prices.json` the only record of your price history, so it's treated
+as your data rather than a cache: a pull keeps the previous copy at
+`prices.json.bak` and swaps the new one in atomically, and a table it can't
+parse is an error that leaves the file untouched — never a reason to rebuild it
+from scratch.
 
 Providers that bill by the clock get a recurring UTC discount window. DeepSeek,
 whose off-peak rate is half its peak rate:
@@ -225,6 +231,11 @@ whose off-peak rate is half its peak rate:
 
 Base rates always hold the undiscounted price, so a window you forget to write
 overcharges you on paper rather than hiding spend.
+
+A revision only has to state what changed. Anything it leaves out — cache
+accounting, context tiers — it inherits from the base entry, so a hand-written
+revision can't quietly delete pricing it didn't mention. To record a tier a
+provider actually retired, say so with `"tiers": []`.
 
 turnpike never guesses tokens a provider didn't report. A call that comes back with
 no usage is saved as exactly that — no counts, marked `no_usage` — so nothing

@@ -1,5 +1,5 @@
 use crate::record::Usage;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -109,9 +109,16 @@ pub struct Rates {
     /// rate once the prompt exceeds a threshold). When a request's input
     /// context exceeds a tier's `above_input_tokens`, that tier's rates
     /// replace the base rates for the *whole* request — providers reprice the
-    /// entire call, not just the overflow. Empty for flat-priced models.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tiers: Vec<Tier>,
+    /// entire call, not just the overflow.
+    ///
+    /// Absent (`None`) means *unstated*, not *none*: on a revision it inherits
+    /// the model's base tiers, so a hand-authored revision that lists only the
+    /// rates it knows about cannot silently delete tier pricing and
+    /// under-report every large-context call after its date. Write `[]` to say
+    /// a provider genuinely dropped its tiers. On the base entry there is
+    /// nothing to inherit, so absent and empty mean the same thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<Tier>>,
     /// Recurring time-of-day discount, if the provider prices by clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off_peak: Option<OffPeak>,
@@ -169,28 +176,53 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One rate set with tier inheritance already resolved: the rates a revision
+/// (or the base) states, plus the tiers actually in force for it.
+#[derive(Clone, Copy)]
+struct RatesAt<'a> {
+    rates: &'a Rates,
+    tiers: &'a [Tier],
+}
+
 impl ModelPrices {
+    /// The tiers stated on the base entry — what a revision inherits when it
+    /// says nothing about tiers.
+    fn base_tiers(&self) -> &[Tier] {
+        self.base.tiers.as_deref().unwrap_or(&[])
+    }
+
+    fn resolve<'a>(&'a self, rates: &'a Rates) -> RatesAt<'a> {
+        RatesAt {
+            rates,
+            tiers: rates.tiers.as_deref().unwrap_or_else(|| self.base_tiers()),
+        }
+    }
+
     /// The rates billing a call made at `at`: the newest revision that had
     /// taken effect by then, else the base rates. Robust to revision ordering.
-    fn rates_at(&self, at: Timestamp) -> &Rates {
-        self.revisions
+    fn rates_at(&self, at: Timestamp) -> RatesAt<'_> {
+        let rates = self
+            .revisions
             .iter()
             .filter(|r| r.effective_from <= at)
             .max_by_key(|r| r.effective_from)
-            .map_or(&self.base, |r| &r.rates)
+            .map_or(&self.base, |r| &r.rates);
+        self.resolve(rates)
     }
 
     /// The rates currently in effect — what a fresh pull should be compared
     /// against.
-    fn newest(&self) -> &Rates {
-        self.revisions
+    fn newest(&self) -> RatesAt<'_> {
+        let rates = self
+            .revisions
             .iter()
             .max_by_key(|r| r.effective_from)
-            .map_or(&self.base, |r| &r.rates)
+            .map_or(&self.base, |r| &r.rates);
+        self.resolve(rates)
     }
 }
 
-impl Rates {
+impl RatesAt<'_> {
     /// Per-million (input, output, cache_read, cache_creation) rates for a
     /// request whose input context is `context_tokens`, made at `at`. Selects
     /// the highest context tier the request exceeds, falling back to the base
@@ -211,12 +243,16 @@ impl Rates {
                 )
             })
             .unwrap_or((
-                self.input_per_m,
-                self.output_per_m,
-                self.cache_read_per_m,
-                self.cache_creation_per_m,
+                self.rates.input_per_m,
+                self.rates.output_per_m,
+                self.rates.cache_read_per_m,
+                self.rates.cache_creation_per_m,
             ));
-        let f = self.off_peak.as_ref().map_or(1.0, |w| w.factor_at(at));
+        let f = self
+            .rates
+            .off_peak
+            .as_ref()
+            .map_or(1.0, |w| w.factor_at(at));
         (i * f, o * f, cr * f, cc * f)
     }
 }
@@ -233,47 +269,60 @@ fn is_canonical_key(k: &str) -> bool {
 
 /// A listing that actually charges for tokens: nonzero input or output rate.
 fn has_real_rates(m: &ModelPrices) -> bool {
-    let r = m.newest();
+    let r = m.newest().rates;
     r.input_per_m > 0.0 || r.output_per_m > 0.0
+}
+
+/// Fold case-variant keys onto one lowercase entry, keeping the best listing.
+///
+/// Lowercased keys can collide across listings ("Qwen/..." vs "qwen/..." for
+/// the same model), and map iteration order is random per process, so
+/// collisions are resolved by an explicit preference, best first, with the
+/// first insertion winning:
+///
+///   1. A listing with real (nonzero input or output) rates beats a free one —
+///      pricing token-bearing calls at a confident $0 would silently
+///      under-report spend.
+///   2. A key already in canonical form (equal to its own lowercase) beats a
+///      mixed-case one. `pull` lowercases every key it writes and inserts
+///      canonical providers first, so the canonical-form key *is* the entry a
+///      current pull produced; a mixed-case sibling is a legacy re-listing
+///      from a reseller, whose rates differ from the provider's own. Without
+///      this, `DeepSeek-V4-Pro` (a reseller at 0.4286/0.8571, no cache rate)
+///      outranked `deepseek-v4-pro` (DeepSeek's own 0.435/0.87/0.003625) on
+///      nothing but `'D' < 'd'`.
+///   3. Among equals, the lexicographically smaller key — so two loads can
+///      never disagree.
+///
+/// Returns the collapsed table and how many entries lost a collision. `load`
+/// and `pull` both go through here, so the entry `pull` merges into is the
+/// same one `compute` will later price with — a `pinned` flag or a hand-authored
+/// window on a mixed-case key would otherwise be invisible to the merge and
+/// then lose the collision to the fresh entry `pull` inserted beside it.
+fn canonicalize(entries: Vec<(String, ModelPrices)>) -> (BTreeMap<String, ModelPrices>, usize) {
+    let mut entries = entries;
+    entries.sort_by(|(ka, a), (kb, b)| {
+        // false sorts first, so negate the "better" predicates.
+        (!has_real_rates(a), !is_canonical_key(ka))
+            .cmp(&(!has_real_rates(b), !is_canonical_key(kb)))
+            .then_with(|| ka.cmp(kb))
+    });
+    let total = entries.len();
+    let mut out = BTreeMap::new();
+    for (k, e) in entries {
+        out.entry(k.to_ascii_lowercase()).or_insert(e);
+    }
+    let collapsed = total - out.len();
+    (out, collapsed)
 }
 
 impl PriceTable {
     fn from_json(json: &str) -> Result<Self> {
         let raw: HashMap<String, ModelPrices> = serde_json::from_str(json)?;
-        // Lowercased keys can collide across listings ("Qwen/..." vs
-        // "qwen/..." for the same model). HashMap iteration order is random
-        // per process, so collisions are resolved by an explicit preference,
-        // best first, and the first insertion wins:
-        //
-        //   1. A listing with real (nonzero input or output) rates beats a
-        //      free one — pricing token-bearing calls at a confident $0 would
-        //      silently under-report spend.
-        //   2. A key already in canonical form (equal to its own lowercase)
-        //      beats a mixed-case one. `pull` lowercases every key it writes
-        //      and inserts canonical providers first, so the canonical-form
-        //      key *is* the entry a current pull produced; a mixed-case
-        //      sibling is a legacy re-listing from a reseller, whose rates
-        //      differ from the provider's own. Without this, `DeepSeek-V4-Pro`
-        //      (a reseller at 0.4286/0.8571, no cache rate) outranked
-        //      `deepseek-v4-pro` (DeepSeek's own 0.435/0.87/0.003625) on
-        //      nothing but `'D' < 'd'`.
-        //   3. Among equals, the lexicographically smaller key — so two loads
-        //      can never disagree.
-        let mut keys: Vec<&String> = raw.keys().collect();
-        keys.sort_by(|a, b| {
-            let rank = |k: &String| {
-                let e = &raw[k];
-                // false sorts first, so negate the "better" predicates.
-                (!has_real_rates(e), !is_canonical_key(k))
-            };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
-        let mut map = HashMap::with_capacity(raw.len());
-        for k in keys {
-            map.entry(k.to_ascii_lowercase())
-                .or_insert_with(|| raw[k].clone());
-        }
-        Ok(Self { map })
+        let (table, _) = canonicalize(raw.into_iter().collect());
+        Ok(Self {
+            map: table.into_iter().collect(),
+        })
     }
 
     pub fn load(local_path: &Path) -> Self {
@@ -284,7 +333,14 @@ impl PriceTable {
             Some(table) => table,
             None => {
                 if local_path.exists() {
-                    log::warn!("turnpike: ignoring malformed {}", local_path.display());
+                    // Loud, and not through `log`: env_logger defaults to
+                    // error-only, so a warning here would never be seen, and
+                    // the symptom — every computed cost silently missing — is
+                    // easy to misread as "these calls were free".
+                    eprintln!(
+                        "turnpike: {} is malformed; every computed cost will be missing                          until it parses",
+                        local_path.display()
+                    );
                 }
                 Self {
                     map: HashMap::new(),
@@ -355,22 +411,25 @@ impl PriceTable {
     }
 }
 
-/// True when two rate sets would bill differently. `off_peak` is deliberately
-/// not compared: models.dev never supplies it, so a fetched rate set always
-/// has `None` and comparing it would append a spurious revision on every pull
-/// for any model carrying a hand-authored window.
-fn rates_differ(a: &Rates, b: &Rates) -> bool {
+/// True when two rate sets would bill differently. Tiers are compared *after*
+/// inheritance is resolved, so a stored revision that inherits its tiers reads
+/// as equal to an upstream entry that states the same ones. `off_peak` is
+/// deliberately not compared: models.dev never supplies it, so a fetched rate
+/// set always has `None` and comparing it would append a spurious revision on
+/// every pull for any model carrying a hand-authored window.
+fn rates_differ(a: RatesAt<'_>, b: RatesAt<'_>) -> bool {
     // models.dev round-trips f64 exactly, so any real difference is a price
     // change; the epsilon only absorbs hand-edited values.
     fn ne(x: f64, y: f64) -> bool {
         (x - y).abs() > 1e-12 * x.abs().max(y.abs()).max(1.0)
     }
-    ne(a.input_per_m, b.input_per_m)
-        || ne(a.output_per_m, b.output_per_m)
-        || ne(a.cache_read_per_m, b.cache_read_per_m)
-        || ne(a.cache_creation_per_m, b.cache_creation_per_m)
+    let (ra, rb) = (a.rates, b.rates);
+    ne(ra.input_per_m, rb.input_per_m)
+        || ne(ra.output_per_m, rb.output_per_m)
+        || ne(ra.cache_read_per_m, rb.cache_read_per_m)
+        || ne(ra.cache_creation_per_m, rb.cache_creation_per_m)
         || a.tiers.len() != b.tiers.len()
-        || a.tiers.iter().zip(&b.tiers).any(|(x, y)| {
+        || a.tiers.iter().zip(b.tiers).any(|(x, y)| {
             x.above_input_tokens != y.above_input_tokens
                 || ne(x.input_per_m, y.input_per_m)
                 || ne(x.output_per_m, y.output_per_m)
@@ -385,6 +444,17 @@ struct MergeSummary {
     revised: usize,
     unchanged: usize,
     pinned: usize,
+    /// Entries whose stored `cache_in_input` disagreed with upstream's
+    /// accounting shape and was corrected. Rates are versioned; the shape is
+    /// not, so this is the one field a pull still overwrites in place.
+    reshaped: usize,
+    /// Case-variant keys folded onto their canonical lowercase entry. They
+    /// were already unreachable — `load` resolved the same collision — so this
+    /// makes the file agree with what pricing actually used.
+    collapsed: usize,
+    /// False when there was no table before this pull, so the counts below
+    /// would be noise.
+    had_table: bool,
     /// Models that gained a revision while their current rates carried a
     /// hand-authored `off_peak` window. models.dev cannot supply a window, so
     /// the new revision has none and the discount stops applying from that
@@ -405,6 +475,48 @@ struct MergeSummary {
 /// some time before you pulled. Correct it by editing the timestamp in
 /// `prices.json`; the next pull sees the rates already match and appends
 /// nothing.
+impl MergeSummary {
+    fn print(&self, dest: &Path) {
+        if !self.had_table {
+            return;
+        }
+        println!(
+            "  {} new, {} repriced (revision effective now), {} unchanged, {} pinned",
+            self.added, self.revised, self.unchanged, self.pinned
+        );
+        if self.revised > 0 {
+            println!(
+                "  note: revisions are stamped with the pull time; if you know when a \
+                 price actually changed, edit `effective_from` in {}",
+                dest.display()
+            );
+        }
+        if self.reshaped > 0 {
+            println!(
+                "  note: {} entries had their cache accounting (`cache_in_input`) \
+                 corrected from upstream",
+                self.reshaped
+            );
+        }
+        if self.collapsed > 0 {
+            println!(
+                "  note: {} case-variant keys folded onto their canonical entry \
+                 (they were already unreachable); previous file kept at {}",
+                self.collapsed,
+                dest.with_extension("json.bak").display()
+            );
+        }
+        if !self.window_conflicts.is_empty() {
+            // The discount silently stops applying from the new revision on.
+            println!(
+                "  warning: repriced with a time-of-day discount upstream cannot know about; \
+                 re-declare `off_peak` on the new revision or set \"pinned\": true — {}",
+                self.window_conflicts.join(", ")
+            );
+        }
+    }
+}
+
 fn merge(
     mut table: BTreeMap<String, ModelPrices>,
     fetched: BTreeMap<String, ModelPrices>,
@@ -419,13 +531,29 @@ fn merge(
             }
             Some(stored) if stored.pinned => s.pinned += 1,
             Some(stored) => {
-                if rates_differ(stored.newest(), &incoming.base) {
-                    if stored.newest().off_peak.is_some() {
+                // Rates are versioned; the cache-accounting *shape* is not — it
+                // is a property of the provider's API, so upstream owns it and
+                // a pull must still be able to correct it in place. Leaving it
+                // frozen would mean a table pulled before a shape fix keeps
+                // mispricing forever.
+                if stored.cache_in_input != incoming.cache_in_input {
+                    stored.cache_in_input = incoming.cache_in_input;
+                    s.reshaped += 1;
+                }
+                if rates_differ(stored.newest(), incoming.newest()) {
+                    if stored.newest().rates.off_peak.is_some() {
                         s.window_conflicts.push(key.clone());
+                    }
+                    // State tiers explicitly on an appended revision: inheritance
+                    // exists for hand-authored revisions, and upstream dropping a
+                    // tier must not read as "keep the old one".
+                    let mut rates = incoming.base;
+                    if rates.tiers.is_none() && !stored.base_tiers().is_empty() {
+                        rates.tiers = Some(Vec::new());
                     }
                     stored.revisions.push(Revision {
                         effective_from: now,
-                        rates: incoming.base,
+                        rates,
                     });
                     s.revised += 1;
                 } else {
@@ -510,7 +638,7 @@ fn parse_models_dev(body: &str) -> Result<BTreeMap<String, ModelPrices>> {
                     ts.sort_by_key(|t| t.above_input_tokens);
                     ts
                 })
-                .unwrap_or_default();
+                .filter(|ts| !ts.is_empty());
             // Dedupe case-insensitively: the same model re-listed as
             // "Qwen/..." and "qwen/..." must collapse to one entry (the
             // earlier provider in the ordered pass wins).
@@ -542,50 +670,75 @@ fn parse_models_dev(body: &str) -> Result<BTreeMap<String, ModelPrices>> {
     Ok(out)
 }
 
+/// Read the stored table, resolving case-variant keys the same way `load`
+/// does. A file that will not parse is an **error**, never an empty table: the
+/// entry point for hand-editing is this file, so a typo'd `effective_from`
+/// must not let the caller rebuild it from upstream and drop every revision,
+/// window, and `pinned` flag along the way.
+fn read_table(path: &Path) -> Result<(BTreeMap<String, ModelPrices>, usize, bool)> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), 0, false))
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let raw: HashMap<String, ModelPrices> = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} is malformed — refusing to overwrite it, since it is the only \
+             record of your price history. Fix the JSON (or move it aside) and pull again",
+            path.display()
+        )
+    })?;
+    let (table, collapsed) = canonicalize(raw.into_iter().collect());
+    Ok((table, collapsed, true))
+}
+
+/// Write the table durably. This file stopped being a disposable cache of
+/// models.dev the moment it started carrying hand-authored revisions and
+/// windows — nothing upstream can reconstruct those — so the previous copy is
+/// kept and the new one is swapped in by rename, which an interrupted write
+/// cannot truncate.
+fn write_table(dest: &Path, table: &BTreeMap<String, ModelPrices>) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Sorted keys: the file is byte-identical across pulls of the same data.
+    let json = serde_json::to_string_pretty(table)?;
+    if dest.exists() {
+        std::fs::copy(dest, dest.with_extension("json.bak"))
+            .with_context(|| format!("backing up {}", dest.display()))?;
+    }
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("replacing {}", dest.display()))?;
+    Ok(())
+}
+
+/// Fold a fetch into the table at `dest` and write it back. Split from `pull`
+/// so the file handling is testable without the network.
+fn apply_pull(
+    dest: &Path,
+    fetched: BTreeMap<String, ModelPrices>,
+    now: Timestamp,
+) -> Result<(usize, MergeSummary)> {
+    let (stored, collapsed, had_table) = read_table(dest)?;
+    let (table, mut s) = merge(stored, fetched, now);
+    s.collapsed = collapsed;
+    s.had_table = had_table;
+    write_table(dest, &table)?;
+    Ok((table.len(), s))
+}
+
 /// Fetch prices from models.dev and fold them into the table at `dest`,
 /// appending a dated revision wherever a price moved. Prints a summary.
 pub async fn pull(dest: &Path) -> Result<()> {
     println!("Fetching {MODELS_DEV_URL} ...");
     let body = reqwest::get(MODELS_DEV_URL).await?.text().await?;
     let fetched = parse_models_dev(&body)?;
-
-    let stored: BTreeMap<String, ModelPrices> = std::fs::read_to_string(dest)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let had_table = !stored.is_empty();
-
-    let (table, s) = merge(stored, fetched, Timestamp::now());
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Sorted keys: the file is byte-identical across pulls of the same data.
-    let json = serde_json::to_string_pretty(&table)?;
-    std::fs::write(dest, json)?;
-
-    println!("Saved {} models to {}", table.len(), dest.display());
-    if had_table {
-        println!(
-            "  {} new, {} repriced (revision effective now), {} unchanged, {} pinned",
-            s.added, s.revised, s.unchanged, s.pinned
-        );
-        if s.revised > 0 {
-            println!(
-                "  note: revisions are stamped with the pull time; if you know when a \
-                 price actually changed, edit `effective_from` in {}",
-                dest.display()
-            );
-        }
-        if !s.window_conflicts.is_empty() {
-            // The discount silently stops applying from the new revision on.
-            println!(
-                "  warning: repriced with a time-of-day discount upstream cannot know about; \
-                 re-declare `off_peak` on the new revision or set \"pinned\": true — {}",
-                s.window_conflicts.join(", ")
-            );
-        }
-    }
+    let (models, s) = apply_pull(dest, fetched, Timestamp::now())?;
+    println!("Saved {models} models to {}", dest.display());
+    s.print(dest);
     Ok(())
 }
 
@@ -1028,8 +1181,14 @@ mod tests {
         assert_eq!(m.base.input_per_m, 0.435);
         assert_eq!(m.revisions.len(), 1);
         assert_eq!(m.revisions[0].effective_from, now);
-        assert_eq!(m.rates_at(at("2026-08-19T00:00:00Z")).input_per_m, 0.435);
-        assert_eq!(m.rates_at(at("2026-08-21T00:00:00Z")).input_per_m, 1.32);
+        assert_eq!(
+            m.rates_at(at("2026-08-19T00:00:00Z")).rates.input_per_m,
+            0.435
+        );
+        assert_eq!(
+            m.rates_at(at("2026-08-21T00:00:00Z")).rates.input_per_m,
+            1.32
+        );
     }
 
     #[test]
@@ -1117,5 +1276,245 @@ mod tests {
         );
         assert_eq!((s.added, s.revised), (1, 0));
         assert!(table["m"].revisions.is_empty());
+    }
+
+    // ---- tier inheritance on revisions -----------------------------------
+
+    /// A model with a context tier that later gains a dated price change. The
+    /// revision states only the rates it knows about, which is the shape the
+    /// README documents and the shape `merge` writes for flat models.
+    fn tiered_with_revision(revision_tiers: &str) -> PriceTable {
+        let json = format!(
+            r#"{{
+            "g": {{"input_per_m":1.25,"output_per_m":2.5,"cache_in_input":true,
+                  "tiers":[{{"above_input_tokens":200000,"input_per_m":2.5,"output_per_m":5.0}}],
+                  "revisions":[{{"effective_from":"2026-08-16T00:00:00Z",
+                                "input_per_m":1.50,"output_per_m":3.0{revision_tiers}}}]}}
+        }}"#
+        );
+        PriceTable::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn revision_without_tiers_inherits_them_instead_of_dropping_them() {
+        // Unstated is not the same as none. Dropping the tier here would have
+        // made a *price rise* read as 40% cheaper for every large-context call
+        // after the revision date (250k billed at the 1.50 base, not the 2.5
+        // tier) — under-reporting, the one direction this table must never go.
+        let t = tiered_with_revision("");
+        let big = usage(250_000, 0, 0, 0);
+        let before = t
+            .compute(Some("g"), &big, at("2026-08-01T00:00:00Z"))
+            .unwrap();
+        let after = t
+            .compute(Some("g"), &big, at("2026-08-20T00:00:00Z"))
+            .unwrap();
+        // Hand-derived: 250k over the 200k threshold bills the whole request at
+        // the tier rate, 250k * 2.5/M = 0.625, on both sides of the revision.
+        assert!((before - 0.625).abs() < 1e-12);
+        assert!((after - 0.625).abs() < 1e-12);
+
+        // The revision still moves the base rate for requests under the tier.
+        let small = usage(100_000, 0, 0, 0);
+        let under_before = t
+            .compute(Some("g"), &small, at("2026-08-01T00:00:00Z"))
+            .unwrap();
+        let under_after = t
+            .compute(Some("g"), &small, at("2026-08-20T00:00:00Z"))
+            .unwrap();
+        assert!((under_before - 0.125).abs() < 1e-12);
+        assert!((under_after - 0.15).abs() < 1e-12);
+    }
+
+    #[test]
+    fn revision_with_explicit_empty_tiers_drops_them() {
+        // The escape hatch: a provider that genuinely retired its tier is
+        // written `"tiers": []`, and then the base rate bills the whole call.
+        let t = tiered_with_revision(r#","tiers":[]"#);
+        let big = usage(250_000, 0, 0, 0);
+        let after = t
+            .compute(Some("g"), &big, at("2026-08-20T00:00:00Z"))
+            .unwrap();
+        // Hand-derived: 250k * 1.50/M = 0.375, no tier in force.
+        assert!((after - 0.375).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merge_states_tiers_explicitly_on_an_appended_revision() {
+        // `merge` must not lean on inheritance: upstream dropping a tier has to
+        // be recorded as a drop, not read back as "keep the old one".
+        let mut stored = entry(1.25, 2.5);
+        stored.base.tiers = Some(vec![Tier {
+            above_input_tokens: 200_000,
+            input_per_m: 2.5,
+            output_per_m: 5.0,
+            cache_read_per_m: 0.0,
+            cache_creation_per_m: 0.0,
+        }]);
+        let (table, s) = merge(
+            one("g", stored),
+            one("g", entry(1.50, 3.0)),
+            at("2026-08-20T00:00:00Z"),
+        );
+        assert_eq!(s.revised, 1);
+        let recorded = table["g"].revisions[0].rates.tiers.as_deref();
+        assert!(
+            matches!(recorded, Some([])),
+            "tiers must be stated, not inherited"
+        );
+    }
+
+    #[test]
+    fn merge_corrects_the_cache_accounting_shape_in_place() {
+        // Rates are versioned; the accounting shape is a property of the
+        // provider's API, so upstream owns it. A table pulled before a shape
+        // fix must not keep mispricing forever.
+        let mut stored = entry(3.0, 15.0);
+        stored.cache_in_input = true; // wrong: Anthropic reports cache additively
+        let mut incoming = entry(3.0, 15.0);
+        incoming.cache_in_input = false;
+        let (table, s) = merge(
+            one("claude-sonnet-4", stored),
+            one("claude-sonnet-4", incoming),
+            at("2026-08-20T00:00:00Z"),
+        );
+        // The rates did not move, so no revision — but the shape is corrected.
+        assert_eq!((s.revised, s.unchanged, s.reshaped), (0, 1, 1));
+        assert!(!table["claude-sonnet-4"].cache_in_input);
+    }
+
+    // ---- pull: the table is user data, not a cache ------------------------
+
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("turnpike-prices-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir.join(name))
+        }
+        fn write(&self, contents: &str) {
+            std::fs::write(&self.0, contents).unwrap();
+        }
+        fn read(&self) -> String {
+            std::fs::read_to_string(&self.0).unwrap()
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn pull_refuses_to_overwrite_a_malformed_table() {
+        // `prices.json` is hand-edited by design — `pull` prints the
+        // instruction to do it. Dropping the `Z` off an `effective_from` makes
+        // the whole file unparseable, and treating that as "no table yet" would
+        // silently rebuild it from upstream: every revision, window, and
+        // `pinned` flag gone, and unreconstructable since upstream publishes
+        // only today's price.
+        let f = TempFile::new("prices.json");
+        let broken = r#"{"m":{"input_per_m":1.0,"output_per_m":1.0,
+            "revisions":[{"effective_from":"2026-08-16T16:00","input_per_m":2.0,"output_per_m":2.0}]}}"#;
+        f.write(broken);
+
+        let err = apply_pull(
+            f.path(),
+            one("m", entry(9.0, 9.0)),
+            at("2026-08-20T00:00:00Z"),
+        )
+        .err()
+        .expect("a malformed table must be an error, not an empty table");
+        assert!(
+            err.to_string().contains("malformed"),
+            "unhelpful error: {err}"
+        );
+        assert_eq!(f.read(), broken, "the file must be left exactly as it was");
+    }
+
+    #[test]
+    fn pull_keeps_the_previous_table_as_a_backup() {
+        let f = TempFile::new("prices.json");
+        f.write(r#"{"m":{"input_per_m":1.0,"output_per_m":1.0}}"#);
+        let (_, s) = apply_pull(
+            f.path(),
+            one("m", entry(2.0, 2.0)),
+            at("2026-08-20T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(s.revised, 1);
+        let bak = std::fs::read_to_string(f.path().with_extension("json.bak")).unwrap();
+        assert!(bak.contains("1.0") && !bak.contains("2.0"));
+        // And no scratch file is left behind by the atomic swap.
+        assert!(!f.path().with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn pull_creates_the_table_when_none_exists() {
+        let f = TempFile::new("prices.json");
+        let (n, s) = apply_pull(
+            f.path(),
+            one("m", entry(1.0, 2.0)),
+            at("2026-08-20T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!((n, s.added, s.had_table), (1, 1, false));
+        assert!(!f.path().with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn pull_honors_a_pinned_entry_stored_under_a_case_variant_key() {
+        // models.dev keys are lowercased, but a table can hold mixed-case
+        // re-listings (294 of them on the host this was found on). Matching
+        // case-sensitively meant the fetch missed the pinned entry and inserted
+        // a second, unpinned one beside it — which then *won* the load-time
+        // collision on the canonical-key rule, so the pin protected nothing.
+        let f = TempFile::new("prices.json");
+        f.write(
+            r#"{"Qwen/Qwen3-Max":{"input_per_m":1.32,"output_per_m":3.96,"pinned":true,
+                "off_peak":{"utc":["10:00-01:00"],"multiplier":0.5}}}"#,
+        );
+        let (n, s) = apply_pull(
+            f.path(),
+            one("qwen/qwen3-max", entry(0.66, 1.98)),
+            at("2026-08-20T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!((n, s.pinned, s.added, s.collapsed), (1, 1, 0, 0));
+
+        let t = PriceTable::load(f.path());
+        let m = t.lookup("qwen/qwen3-max").unwrap();
+        assert!(m.pinned);
+        assert_eq!(m.base.input_per_m, 1.32);
+        assert!(m.base.off_peak.is_some());
+    }
+
+    #[test]
+    fn pull_folds_case_variant_keys_onto_the_entry_pricing_already_used() {
+        // Both listings are paid, so the canonical lowercase key wins — the
+        // same entry `load` was already picking. Folding makes the file say so.
+        let f = TempFile::new("prices.json");
+        f.write(
+            r#"{"a-model":{"input_per_m":1.0,"output_per_m":1.0},
+                "A-Model":{"input_per_m":2.0,"output_per_m":2.0}}"#,
+        );
+        let (n, s) = apply_pull(f.path(), BTreeMap::new(), at("2026-08-20T00:00:00Z")).unwrap();
+        assert_eq!((n, s.collapsed), (1, 1));
+        assert_eq!(
+            PriceTable::load(f.path())
+                .lookup("a-model")
+                .unwrap()
+                .base
+                .input_per_m,
+            1.0
+        );
     }
 }
