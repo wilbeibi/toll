@@ -57,14 +57,21 @@ qwen/qwen3-coder-480b  1      44021    12134    0           0            -      
 ## Install
 
 ```zsh
-git clone https://github.com/wilbeibi/turnpike
-cd turnpike
-cargo install --path .
+cargo install turnpike
 turnpike start                 # start the listeners (runs in the foreground)
 turnpike prices pull           # optional: pull a price table so costs are filled in
 ```
 
-Building needs a Rust toolchain; there are no prebuilt binaries yet.
+Or from a clone, to build what's on `main`:
+
+```zsh
+git clone https://github.com/wilbeibi/turnpike
+cd turnpike
+cargo install --path .
+```
+
+Either way it builds from source, so you need a Rust toolchain; there are no
+prebuilt binaries yet.
 
 ### Keeping it running
 
@@ -285,4 +292,4 @@ laptop spent $40 last Tuesday, that's this.
 
 ## Status
 
-`0.1.0`. One Rust binary, MIT-licensed.
+`0.3.0`. One Rust binary, MIT-licensed.
