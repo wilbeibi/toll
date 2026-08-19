@@ -11,7 +11,7 @@ Turn turnpike's recorded facts into a spend report plus model-substitution sugge
 
 - `turnpike stats` / `turnpike tail` — first choice. Grouping: `--by-model | --by-client | --by-exe | --by-tool | --by-day`; filter `--since 30m|12h|7d|today|2026-07-01`; `--json` includes computed costs. Run `turnpike stats --help` for details.
 - `~/.local/share/turnpike/calls.db` — SQLite (WAL; read-only queries are safe), table `calls`. Key columns: `ts, provider, model, client, client_source, endpoint, peer_exe, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens, cost, raw_usage, anomaly`.
-- `~/.local/share/turnpike/prices.json` — current rates. Refresh with `turnpike prices pull` before repricing anything.
+- `~/.local/share/turnpike/prices.json` — rates over time (dated `revisions`, `off_peak` windows). Refresh with `turnpike prices pull` (appends revisions, never overwrites) before repricing anything.
 - Quality benchmarks: fetch live (models.dev API, Artificial Analysis, LMArena) — never rank model quality from memory; it stales in weeks.
 
 ## Workflow
@@ -51,7 +51,7 @@ FROM g WHERE gap IS NOT NULL GROUP BY bucket ORDER BY MIN(gap);
 
 ## Semantic traps (each one has produced a wrong number before)
 
-- **`cost` is historical.** Computed at insert time with then-current rates. Repricing the same tokens with today's `prices.json` can differ by >2× (provider price cuts). Report stored `cost` as "what was paid"; label any repriced split "at current rates". Never mix the two in one total.
+- **`cost` is historical.** The stored column is provider-reported at insert time. `turnpike stats`/`tail` fill the gap by pricing each call at the rates in force on its own `ts` (dated `revisions` + `off_peak` windows in `prices.json`), so they are "what was paid" *only as far back as the table records price history* — a model with no revisions is priced at today's rate for all time, which after a change like DeepSeek's 2026-08-16 increase can be off by >2×. Check `turnpike prices show` before trusting a cross-period comparison; label any hand-repriced split "at current rates" and never mix the two in one total.
 - **Cache accounting differs by provider.** OpenAI/DeepSeek/Gemini: `cache_read` is a *subset* of `input_tokens` (uncached = `input − cache_read`). Anthropic: cache fields are *additive* on top of `input_tokens`. Summing across providers without segmenting double-counts. `prices.json` records this per model as `cache_in_input`.
 - **Absent traffic ≠ zero spend.** Subscription tools (Claude Code, Codex) bypass turnpike. Raw `SUM(cost)` also undercounts calls where the provider reported no cost — prefer `turnpike stats`, which fills from the price table.
 - **Each machine has its own DB.** joi and mini run separate turnpike instances; a one-host query is a one-host answer. (mini: `ssh mini`, fish shell.)

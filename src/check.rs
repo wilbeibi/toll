@@ -21,7 +21,7 @@
 //! even when other calls are unpriced — missing data can't make an
 //! already-exceeded budget un-exceeded.
 
-use crate::cost::{call_cost, usage_from_counts};
+use crate::cost::{call_cost, priced_at, usage_from_counts};
 use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
 use crate::record::open_db;
@@ -179,7 +179,8 @@ fn sum_spend(conn: &Connection, prices: &PriceTable, lower: &str) -> Result<(f64
                 COALESCE(output_tokens, 0),
                 COALESCE(cache_read_input_tokens, 0),
                 COALESCE(cache_creation_input_tokens, 0),
-                cost
+                cost,
+                ts
          FROM calls
          WHERE ts >= ?1",
     )?;
@@ -191,15 +192,16 @@ fn sum_spend(conn: &Connection, prices: &PriceTable, lower: &str) -> Result<(f64
             r.get::<_, i64>(3)?,
             r.get::<_, i64>(4)?,
             r.get::<_, Option<f64>>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
 
     let mut spent = 0.0;
     let mut unpriced = 0i64;
     for row in rows {
-        let (model, input, output, cache_read, cache_write, stored) = row?;
+        let (model, input, output, cache_read, cache_write, stored, ts) = row?;
         let usage = usage_from_counts(input, output, cache_read, cache_write);
-        match call_cost(prices, model.as_deref(), stored, &usage) {
+        match call_cost(prices, model.as_deref(), stored, &usage, priced_at(&ts)) {
             Some(c) => spent += c,
             None => unpriced += 1,
         }

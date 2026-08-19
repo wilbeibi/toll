@@ -89,7 +89,8 @@ pub fn run(opts: StatsOpts) -> Result<()> {
                 COALESCE(cache_creation_input_tokens, 0),
                 cost,
                 (error_kind IS NOT NULL OR COALESCE(status, 0) >= 400),
-                latency_ms
+                latency_ms,
+                ts
          FROM calls
          WHERE ts >= ?1"
     );
@@ -115,6 +116,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             r.get::<_, Option<f64>>(9)?,    // stored cost (provider-reported)
             r.get::<_, bool>(10)?,          // is_error (transport or HTTP >= 400)
             r.get::<_, i64>(11)?,           // latency_ms
+            r.get::<_, String>(12)?,        // ts (selects the price revision in force)
         ))
     })?;
 
@@ -132,6 +134,7 @@ pub fn run(opts: StatsOpts) -> Result<()> {
             stored_cost,
             is_error,
             lat,
+            ts,
         ) = row;
 
         // --by-tool groups on the unified attribution chain computed here in
@@ -150,8 +153,15 @@ pub fn run(opts: StatsOpts) -> Result<()> {
         };
 
         let usage = crate::cost::usage_from_counts(input, output, cache_read, cache_write);
-        let call_cost = match crate::cost::call_cost(&prices, model.as_deref(), stored_cost, &usage)
-        {
+        // Priced at the call's own timestamp, not today's rates — a provider
+        // price change must not reprice history (pricing.rs, `rates_at`).
+        let call_cost = match crate::cost::call_cost(
+            &prices,
+            model.as_deref(),
+            stored_cost,
+            &usage,
+            crate::cost::priced_at(&ts),
+        ) {
             Some(c) => c,
             None => {
                 // Token-bearing rows with no price would silently under-report;
