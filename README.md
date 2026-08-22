@@ -265,6 +265,20 @@ Read it with `stats` and `tail`, or open it with any SQLite tool. (The stored
 `cost` column holds only costs the provider itself reported; `stats` and `tail`
 add the computed ones, so use those for a full total.)
 
+## Coding agents
+
+Agents are half the point — they write the scripts that spend the money, and they're
+the ones that will happily hardcode `api.openai.com`. Two skills under `skills/` teach
+them the grammar: `turnpike`, which covers pointing a client at the proxy, naming it
+with `x-turnpike-client`, and reading the cost back, and `turnpike-spend-review`, a
+full teardown of where the money went and whether a cheaper model would do.
+
+Install by pointing your agent's skill directory at them:
+
+```zsh
+ln -s "$PWD/skills/turnpike" "$PWD/skills/turnpike-spend-review" ~/.claude/skills/
+```
+
 ## Alternatives
 
 There are bigger tools in this space. Most of them do more than you need for
