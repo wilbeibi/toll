@@ -36,6 +36,12 @@ pub fn parse_openai(body: &Value) -> Usage {
         cache_read = u.get("cached_tokens").and_then(|v| v.as_u64());
     }
 
+    // OpenRouter: explicit-caching models (Anthropic, Gemini) report tokens
+    // written to cache alongside `cached_tokens`.
+    let cache_creation = in_details
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(|v| v.as_u64());
+
     let out_details = u
         .get("output_tokens_details")
         .or_else(|| u.get("completion_tokens_details"))
@@ -74,7 +80,7 @@ pub fn parse_openai(body: &Value) -> Usage {
         input_tokens,
         output_tokens,
         cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: None,
+        cache_creation_input_tokens: cache_creation,
         reasoning_output_tokens: reasoning,
         cost,
     }
@@ -224,6 +230,26 @@ mod tests {
             "usage": { "prompt_tokens": 17, "completion_tokens": 175, "cost": 0.000346775 }
         }));
         assert_eq!(u.cost, Some(0.000346775));
+    }
+
+    #[test]
+    fn parse_openrouter_cache_write_tokens() {
+        // Real shape from OpenRouter's always-on usage accounting.
+        let u = parse_openai(&json!({
+            "usage": {
+                "prompt_tokens": 1454,
+                "completion_tokens": 3727,
+                "cost": 0.01000692,
+                "prompt_tokens_details": {
+                    "audio_tokens": 0,
+                    "cache_write_tokens": 1200,
+                    "cached_tokens": 254,
+                    "video_tokens": 0
+                }
+            }
+        }));
+        assert_eq!(u.cache_read_input_tokens, Some(254));
+        assert_eq!(u.cache_creation_input_tokens, Some(1200));
     }
 
     #[test]
