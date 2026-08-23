@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         )?,
         Command::Prices { cmd } => match cmd {
             cli::PricesCmd::Pull => pricing::pull(&paths::prices_json()).await?,
-            cli::PricesCmd::Show => pricing::show(&paths::prices_json()),
+            cli::PricesCmd::Show => pricing::show(&paths::prices_json(), &paths::calls_db()),
         },
     }
 

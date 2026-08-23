@@ -204,8 +204,14 @@ turnpike works it out from a local price table you can refresh:
 
 ```zsh
 turnpike prices pull    # refresh the table from models.dev
-turnpike prices show    # what's loaded, and which models changed price
+turnpike prices show    # what the models you actually call cost right now
 ```
+
+`prices show` reads the table against your call log, so it lists the handful of
+models you use rather than the couple of thousand it knows about — the rate in
+force this minute, whether a time-of-day discount is currently applying, and a
+loud `NO PRICE` on anything you call that the table can't price. Models whose
+provider reports its own cost say so: for those the table is never consulted.
 
 Every call is priced at the rates in force **when it was made**, not at today's
 rates. When an upstream price moves, `prices pull` appends a dated revision

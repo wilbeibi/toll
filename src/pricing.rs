@@ -585,6 +585,41 @@ impl PriceTable {
     }
 }
 
+/// One model's rates as they stand at an instant, for display. Distinct from
+/// `compute`, which needs a call to price: this answers "what am I charged for
+/// this model right now", which is otherwise only visible by reading a
+/// thousand-entry JSON file by hand.
+pub struct Quote {
+    pub input_per_m: f64,
+    pub output_per_m: f64,
+    pub cache_read_per_m: f64,
+    /// The time-of-day discount in force; `1.0` when none applies.
+    pub factor: f64,
+    /// True when the model prices by clock at all, so a factor of `1.0` reads
+    /// as "peak right now" rather than "no such thing here".
+    pub by_clock: bool,
+    /// True when context tiers exist, so these are the small-context rates and
+    /// a long prompt pays more.
+    pub tiered: bool,
+}
+
+impl PriceTable {
+    /// The rates billing `model` at `at`, discount already applied.
+    pub fn quote(&self, model: &str, at: Timestamp) -> Option<Quote> {
+        let rates = self.lookup(model)?.rates_at(at);
+        let (input_per_m, output_per_m, cache_read_per_m, _) = rates.effective_rates(0, at);
+        let window = rates.rates.off_peak.as_ref();
+        Some(Quote {
+            input_per_m,
+            output_per_m,
+            cache_read_per_m,
+            factor: window.map_or(1.0, |w| w.factor_at(at)),
+            by_clock: window.is_some(),
+            tiered: !rates.tiers.is_empty(),
+        })
+    }
+}
+
 /// True when two rate sets would bill differently. Tiers are compared *after*
 /// inheritance is resolved, so a stored revision that inherits its tiers reads
 /// as equal to an upstream entry that states the same ones. `off_peak` is
@@ -937,21 +972,160 @@ fn ordered_provider_ids<'a>(
 }
 
 /// Print the active price table source, model count, and time-varying entries.
-pub fn show(local_path: &Path) {
+/// Models this host has actually called: total calls that carried tokens, and
+/// within the most recent few, how many arrived with a cost the provider had
+/// already computed.
+///
+/// The recency window is the point. Whether the table or the provider prices a
+/// model is not a fixed property of either — DeepSeek reported `usage.cost`
+/// until 2026-07-13 and has not since — and the question here is what will
+/// price the *next* call, which a lifetime majority answers wrong for any
+/// provider that ever switched.
+fn models_called(db: &Path) -> Vec<Used> {
+    const RECENT: i64 = 100;
+    let Ok(conn) = crate::record::open_db(db) else {
+        return Vec::new();
+    };
+    // Calls that carried no tokens have no price to get wrong; including them
+    // would pad the list with typo'd model names from failed requests.
+    let sql = "SELECT model, COUNT(*), \
+                      SUM(rn <= ?1), SUM(rn <= ?1 AND cost IS NOT NULL) \
+               FROM (SELECT model, cost, \
+                            ROW_NUMBER() OVER (PARTITION BY model ORDER BY ts DESC) AS rn \
+                     FROM calls \
+                     WHERE model IS NOT NULL AND model <> '' \
+                       AND (COALESCE(input_tokens, 0) > 0 OR COALESCE(output_tokens, 0) > 0)) \
+               GROUP BY model ORDER BY COUNT(*) DESC, model";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([RECENT], |r| {
+        Ok(Used {
+            model: r.get(0)?,
+            calls: r.get(1)?,
+            recent: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            recent_costed: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        })
+    });
+    rows.map(|r| r.flatten().collect()).unwrap_or_default()
+}
+
+/// One model this host calls, as `models_called` counts it.
+struct Used {
+    model: String,
+    calls: i64,
+    recent: i64,
+    recent_costed: i64,
+}
+
+/// What the models you actually call cost, at the rates in force this minute.
+///
+/// The table has thousands of entries and a host uses a handful of them, so
+/// summarizing the *table* answered a question nobody asks. A stale entry, a
+/// missing one, or a discount window that stopped matching reality is
+/// invisible in the file and invisible in `stats` — both just quietly move the
+/// total. Here it is one line.
+fn print_used(prices: &PriceTable, used: &[Used], now: Timestamp) {
+    if used.is_empty() {
+        return;
+    }
+    let rate = |v: f64| {
+        if v > 0.0 {
+            format!("{v:.4}")
+        } else {
+            "-".to_string()
+        }
+    };
+    let rows: Vec<(String, [String; 5])> = used
+        .iter()
+        .map(|u| {
+            let q = prices.quote(&u.model, now);
+            // A provider that reports its own cost is billed from that and
+            // never from the table, so its rates here would be decoration.
+            let note = if u.recent_costed * 2 > u.recent {
+                "provider-priced".to_string()
+            } else {
+                match &q {
+                    None => "NO PRICE".to_string(),
+                    Some(q) if q.factor < 1.0 => format!("off-peak x{}", q.factor),
+                    Some(q) if q.by_clock => "peak".to_string(),
+                    Some(q) if q.tiered => "tiered".to_string(),
+                    Some(_) => "-".to_string(),
+                }
+            };
+            let cols = [
+                u.calls.to_string(),
+                rate(q.as_ref().map_or(0.0, |q| q.input_per_m)),
+                rate(q.as_ref().map_or(0.0, |q| q.output_per_m)),
+                rate(q.as_ref().map_or(0.0, |q| q.cache_read_per_m)),
+                note,
+            ];
+            (u.model.clone(), cols)
+        })
+        .collect();
+
+    let headers = ["model", "calls", "input/M", "output/M", "cache/M", "now"];
+    let mut widths = [headers[0].len(), 5, 7, 8, 7, 0];
+    for (model, cols) in &rows {
+        widths[0] = widths[0].max(model.chars().count());
+        for (w, c) in widths[1..].iter_mut().zip(cols) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    println!();
+    let line = |cells: [&str; 6]| {
+        let mut out = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            // No trailing padding on the last column.
+            if i + 1 == cells.len() {
+                out.push_str(cell);
+            } else {
+                out.push_str(&format!("{cell:<width$}  ", width = widths[i]));
+            }
+        }
+        println!("{}", out.trim_end());
+    };
+    line(headers);
+    for (model, cols) in &rows {
+        line([model, &cols[0], &cols[1], &cols[2], &cols[3], &cols[4]]);
+    }
+    println!();
+}
+
+pub fn show(local_path: &Path, db: &Path) {
     if !local_path.exists() {
         println!("no price table found — run `turnpike prices pull` to fetch one");
         return;
     }
-    let parsed: Option<BTreeMap<String, ModelPrices>> = std::fs::read_to_string(local_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    let Some(table) = parsed else {
-        println!("source: {} — unreadable or malformed", local_path.display());
-        return;
+    let parsed: Result<BTreeMap<String, ModelPrices>> = std::fs::read_to_string(local_path)
+        .context("read")
+        .and_then(|s| serde_json::from_str(&s).context("parse"));
+    let parsed = match parsed {
+        Ok(t) => t,
+        Err(e) => {
+            // Naming the failure matters more here than anywhere else: the
+            // file invites hand-editing, and a table that will not parse
+            // silently drops every computed cost.
+            println!("source: {} — {e:#}", local_path.display());
+            return;
+        }
     };
-    println!("source: {} ({} models)", local_path.display(), table.len());
+    // Collapse case variants exactly as `load` does, so what is shown is what
+    // pricing will actually use.
+    let (entries, _) = canonicalize(parsed.into_iter().collect());
+    let prices = PriceTable {
+        map: entries.into_iter().collect(),
+    };
+    println!(
+        "source: {} ({} models)",
+        local_path.display(),
+        prices.map.len()
+    );
 
-    let mut revised: Vec<(&String, &Revision)> = table
+    print_used(&prices, &models_called(db), Timestamp::now());
+
+    let mut revised: Vec<(&String, &Revision)> = prices
+        .map
         .iter()
         .filter_map(|(k, m)| {
             m.revisions
@@ -960,9 +1134,12 @@ pub fn show(local_path: &Path) {
                 .map(|r| (k, r))
         })
         .collect();
-    revised.sort_by_key(|(_, r)| std::cmp::Reverse(r.effective_from));
-    let pinned = table.values().filter(|m| m.pinned).count();
-    let by_clock = table
+    // Name breaks the tie: several models moving on the same date is the
+    // normal case for one provider, and map order is random per process.
+    revised.sort_by_key(|(k, r)| (std::cmp::Reverse(r.effective_from), *k));
+    let pinned = prices.map.values().filter(|m| m.pinned).count();
+    let by_clock = prices
+        .map
         .values()
         .filter(|m| {
             m.base.off_peak.is_some() || m.revisions.iter().any(|r| r.rates.off_peak.is_some())
@@ -1234,6 +1411,31 @@ mod tests {
             .unwrap();
         // Every rate halved: 0.03388 / 2.
         assert!((cost - 0.01694).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quote_reports_the_rate_in_force_not_the_card_rate() {
+        // What `prices show` puts on screen has to be what the next call will
+        // actually be billed, discount included — a card rate that is never
+        // charged is the thing it exists to stop you from believing.
+        let t = deepseek();
+        let peak = t
+            .quote("deepseek-v4-pro", at("2026-08-17T02:00:00Z"))
+            .unwrap();
+        assert_eq!((peak.input_per_m, peak.output_per_m), (1.32, 3.96));
+        assert_eq!(peak.factor, 1.0);
+        assert!(
+            peak.by_clock,
+            "peak must not read as an unpriced-by-clock model"
+        );
+
+        let off = t
+            .quote("deepseek-v4-pro", at("2026-08-17T12:00:00Z"))
+            .unwrap();
+        assert_eq!((off.input_per_m, off.output_per_m), (0.66, 1.98));
+        assert_eq!(off.factor, 0.5);
+
+        assert!(t.quote("no-such-model", whenever()).is_none());
     }
 
     #[test]
