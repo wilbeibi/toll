@@ -220,8 +220,9 @@ as your data rather than a cache: a pull keeps the previous copy at
 parse is an error that leaves the file untouched — never a reason to rebuild it
 from scratch.
 
-Providers that bill by the clock get a recurring UTC discount window. DeepSeek,
-whose off-peak rate is half its peak rate:
+Providers that bill by the clock get recurring discount windows. DeepSeek,
+whose off-peak rate is half its peak rate and whose peak hours are weekday
+business hours at home:
 
 ```jsonc
 "deepseek-v4-pro": {
@@ -229,12 +230,26 @@ whose off-peak rate is half its peak rate:
   "cache_in_input": true,
   "pinned": true,            // upstream lists one of the two rates; don't clobber this
   "revisions": [{
-    "effective_from": "2026-08-16T16:00:00Z",
+    "effective_from": "2026-08-22T16:00:00Z",
     "input_per_m": 1.32, "output_per_m": 3.96, "cache_read_per_m": 0.044,
-    "off_peak": { "utc": ["10:00-01:00", "04:00-06:00"], "multiplier": 0.5 }
+    "off_peak": { "multiplier": 0.5, "tz": "+08:00", "windows": [
+      "Mon-Fri 00:00-09:00", "Mon-Fri 12:00-14:00", "Mon-Fri 18:00-24:00",
+      "Sat-Sun 00:00-24:00"
+    ]}
   }]
 }
 ```
+
+`tz` is the offset the windows are written in, so you can transcribe a schedule
+the way its provider publishes it instead of translating it into UTC first —
+here the four windows are visibly the week with two holes in it, 09:00–12:00
+and 14:00–18:00, which is what DeepSeek charges peak for. Leave `tz` out and
+the windows are UTC. Fixed offsets only: no provider prices against a clock
+that shifts twice a year.
+
+A window with no day in front of it recurs every day, the way they all used to.
+`Mon-Fri`, `Sat-Sun`, and `Mon,Thu` restrict it, and a window may wrap midnight
+into the next day — `Sun 16:00-01:00` runs to Monday morning.
 
 Base rates always hold the undiscounted price, so a window you forget to write
 overcharges you on paper rather than hiding spend.

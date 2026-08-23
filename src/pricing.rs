@@ -8,22 +8,49 @@ use std::path::Path;
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const MINUTES_PER_DAY: u32 = 24 * 60;
 
-/// Half-open UTC minute-of-day windows, written `"HH:MM-HH:MM"` (end `24:00`
-/// allowed). A window that wraps midnight (`"22:00-02:00"`) is normalized on
-/// load into its two non-wrapping halves, so membership is a flat scan and
+/// Half-open weekly windows, written `"HH:MM-HH:MM"` for every day or with a
+/// leading day-of-week qualifier — `"Sat-Sun 00:00-24:00"`,
+/// `"Mon-Fri 10:00-24:00"`, `"Mon,Thu 09:00-17:00"` — to restrict which days
+/// it lands on (end `24:00` allowed). A window that wraps midnight
+/// (`"22:00-02:00"`) is normalized on load into its two non-wrapping halves,
+/// the second on the following day, so membership is a flat scan and
 /// re-writing the file is idempotent.
+///
+/// Times are read in whatever fixed offset the schedule declares (see
+/// [`Offset`]), which is what lets the table state a provider's rule the way
+/// the provider publishes it rather than as a translation of it. A day and a
+/// time of day are the whole vocabulary that needs: any fixed-offset schedule
+/// is a rotation of the week, and a rotated weekly pattern is still a weekly
+/// pattern.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
-pub struct UtcRanges(Vec<(u32, u32)>);
+pub struct Windows(Vec<Window>);
 
-impl UtcRanges {
-    fn contains(&self, at: Timestamp) -> bool {
-        // Unix time has no leap seconds, so minute-of-day in UTC is pure
-        // arithmetic — no timezone lookup needed.
-        let minute = (at.as_second().rem_euclid(86_400) / 60) as u32;
+/// One normalized window: a set of weekdays (bit 0 = Monday) and a half-open
+/// minute-of-day range, always `from < to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Window {
+    days: u8,
+    from: u32,
+    to: u32,
+}
+
+const ALL_DAYS: u8 = 0b111_1111;
+const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+impl Windows {
+    /// Whether `at` falls in any window, reading them in `tz`.
+    fn contains(&self, at: Timestamp, tz: Offset) -> bool {
+        // Unix time has no leap seconds, so shifting by a fixed offset and
+        // taking the minute of the day and the day of the week is pure
+        // arithmetic — no zone database, nothing that can fail at runtime.
+        let secs = at.as_second() + tz.seconds();
+        let minute = (secs.rem_euclid(86_400) / 60) as u32;
+        // 1970-01-01 was a Thursday: index 3 when Monday is 0.
+        let day = 1u8 << (secs.div_euclid(86_400) + 3).rem_euclid(7);
         self.0
             .iter()
-            .any(|&(from, to)| minute >= from && minute < to)
+            .any(|w| w.days & day != 0 && minute >= w.from && minute < w.to)
     }
 }
 
@@ -39,21 +66,69 @@ fn parse_hhmm(s: &str) -> Result<u32, String> {
     Ok(h * 60 + m)
 }
 
-impl TryFrom<Vec<String>> for UtcRanges {
+/// `"Mon"`, `"Mon-Fri"`, `"Mon,Thu"` — a weekday bitmask. A range may wrap the
+/// week (`"Fri-Mon"`), the same way a time range may wrap midnight.
+fn parse_days(spec: &str) -> Result<u8, String> {
+    fn index(name: &str) -> Result<usize, String> {
+        DAY_NAMES
+            .iter()
+            .position(|d| d.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("unknown day {name:?}, expected Mon..Sun"))
+    }
+    let mut mask = 0u8;
+    for item in spec.split(',') {
+        let (from, to) = match item.trim().split_once('-') {
+            Some((a, b)) => (index(a.trim())?, index(b.trim())?),
+            None => {
+                let d = index(item.trim())?;
+                (d, d)
+            }
+        };
+        for step in 0..=(to + 7 - from) % 7 {
+            mask |= 1u8 << ((from + step) % 7);
+        }
+    }
+    Ok(mask)
+}
+
+/// The same days each shifted one day later — where the post-midnight half of
+/// a wrapping window falls.
+fn next_day(days: u8) -> u8 {
+    ((days << 1) | (days >> 6)) & ALL_DAYS
+}
+
+impl TryFrom<Vec<String>> for Windows {
     type Error = String;
     fn try_from(specs: Vec<String>) -> Result<Self, Self::Error> {
         let mut out = Vec::with_capacity(specs.len());
         for spec in &specs {
-            let (a, b) = spec
+            let spec = spec.trim();
+            // An optional weekday qualifier precedes the time range; without
+            // one the window recurs every day, as it always did.
+            let (days, times) = match spec.split_once(char::is_whitespace) {
+                Some((d, t)) => (parse_days(d)?, t.trim_start()),
+                None => (ALL_DAYS, spec),
+            };
+            let (a, b) = times
                 .split_once('-')
-                .ok_or_else(|| format!("bad window {spec:?}, expected HH:MM-HH:MM"))?;
+                .ok_or_else(|| format!("bad window {spec:?}, expected [Days] HH:MM-HH:MM"))?;
             let (from, to) = (parse_hhmm(a.trim())?, parse_hhmm(b.trim())?);
             match from.cmp(&to) {
-                Ordering::Less => out.push((from, to)),
+                Ordering::Less => out.push(Window { days, from, to }),
                 Ordering::Greater => {
-                    // Wraps midnight: keep the two halves instead.
-                    out.push((from, MINUTES_PER_DAY));
-                    out.push((0, to));
+                    // Wraps midnight: keep the two halves instead, the second
+                    // one day later. For an every-day window both forms cover
+                    // the same instants, so old tables are untouched by this.
+                    out.push(Window {
+                        days,
+                        from,
+                        to: MINUTES_PER_DAY,
+                    });
+                    out.push(Window {
+                        days: next_day(days),
+                        from: 0,
+                        to,
+                    });
                 }
                 Ordering::Equal => return Err(format!("empty window {spec:?}")),
             }
@@ -62,25 +137,121 @@ impl TryFrom<Vec<String>> for UtcRanges {
     }
 }
 
-impl From<UtcRanges> for Vec<String> {
-    fn from(r: UtcRanges) -> Self {
+/// `None` for every day — the unqualified form, so a table that never named a
+/// weekday round-trips byte for byte. Otherwise consecutive days collapse to a
+/// range and the parts join with `,`.
+fn render_days(days: u8) -> Option<String> {
+    if days == ALL_DAYS {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut day = 0;
+    while day < 7 {
+        if days & (1 << day) == 0 {
+            day += 1;
+            continue;
+        }
+        let start = day;
+        while day < 7 && days & (1 << day) != 0 {
+            day += 1;
+        }
+        parts.push(if day - start == 1 {
+            DAY_NAMES[start].to_string()
+        } else {
+            format!("{}-{}", DAY_NAMES[start], DAY_NAMES[day - 1])
+        });
+    }
+    Some(parts.join(","))
+}
+
+impl From<Windows> for Vec<String> {
+    fn from(r: Windows) -> Self {
         fn hhmm(m: u32) -> String {
             format!("{:02}:{:02}", m / 60, m % 60)
         }
         r.0.iter()
-            .map(|&(from, to)| format!("{}-{}", hhmm(from), hhmm(to)))
+            .map(|w| {
+                let times = format!("{}-{}", hhmm(w.from), hhmm(w.to));
+                match render_days(w.days) {
+                    Some(days) => format!("{days} {times}"),
+                    None => times,
+                }
+            })
             .collect()
     }
 }
 
-/// A recurring time-of-day discount (DeepSeek's off-peak window). The base
+/// A fixed UTC offset, written `"+08:00"`, `"-05:00"`, or `"Z"` — the offset
+/// a schedule's windows are stated in.
+///
+/// Fixed offsets only, deliberately: a zone *name* would need a database that
+/// can be missing at runtime, and would buy nothing, because a provider that
+/// prices by clock publishes a rule its own billing can apply — no LLM API
+/// prices against a schedule that shifts twice a year. Keeping it a number
+/// keeps membership pure arithmetic and keeps the code free of any knowledge
+/// about which offset belongs to whom; that stays in the table, where it is
+/// one more field of a rate card.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(try_from = "String", into = "String")]
+pub struct Offset(i32);
+
+impl Offset {
+    fn seconds(self) -> i64 {
+        self.0 as i64 * 60
+    }
+}
+
+impl TryFrom<String> for Offset {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let spec = s.trim();
+        if spec.eq_ignore_ascii_case("z") || spec == "+00:00" || spec == "-00:00" {
+            return Ok(Self(0));
+        }
+        let sign = match spec.as_bytes().first() {
+            Some(b'+') => 1,
+            Some(b'-') => -1,
+            _ => return Err(format!("bad offset {s:?}, expected +HH:MM, -HH:MM, or Z")),
+        };
+        let minutes: i32 = parse_hhmm(&spec[1..])
+            .map_err(|e| format!("bad offset {s:?}: {e}"))?
+            .try_into()
+            .map_err(|_| format!("bad offset {s:?}"))?;
+        // Real offsets run -12:00..+14:00; the slack costs nothing and the
+        // bound keeps a typo'd day count from reading as a timezone.
+        if minutes > 18 * 60 {
+            return Err(format!("{s:?} is more than 18 hours from UTC"));
+        }
+        Ok(Self(sign * minutes))
+    }
+}
+
+impl From<Offset> for String {
+    fn from(o: Offset) -> Self {
+        if o.0 == 0 {
+            return "Z".to_string();
+        }
+        let (sign, m) = if o.0 < 0 { ('-', -o.0) } else { ('+', o.0) };
+        format!("{sign}{:02}:{:02}", m / 60, m % 60)
+    }
+}
+
+/// A recurring discount for a provider that prices by the clock. The base
 /// rates always hold the *undiscounted* price, so a window that is missing or
 /// mis-specified over-reports spend rather than under-reporting it — the same
 /// bias as `call_cost` refusing to return a confident $0.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct OffPeak {
-    pub utc: UtcRanges,
-    /// Factor applied to every rate inside the window (DeepSeek: `0.5`).
+    /// The offset `windows` are written in. Absent means UTC, which is how
+    /// every table written before offsets existed reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<Offset>,
+    /// Accepts the old key `utc`, from before a schedule could name an
+    /// offset — those windows were UTC by definition, and `tz` is absent, so
+    /// they keep pricing identically.
+    #[serde(alias = "utc")]
+    pub windows: Windows,
+    /// Factor applied to every rate inside the windows.
     pub multiplier: f64,
 }
 
@@ -89,7 +260,10 @@ impl OffPeak {
     /// finite number is ignored: a malformed discount must over-report, never
     /// silently zero out spend.
     fn factor_at(&self, at: Timestamp) -> f64 {
-        if self.multiplier > 0.0 && self.multiplier.is_finite() && self.utc.contains(at) {
+        if self.multiplier > 0.0
+            && self.multiplier.is_finite()
+            && self.windows.contains(at, self.tz.unwrap_or_default())
+        {
             self.multiplier
         } else {
             1.0
@@ -1131,23 +1305,167 @@ mod tests {
     }
 
     #[test]
-    fn utc_ranges_normalize_and_round_trip() {
-        let r = UtcRanges::try_from(vec!["10:00-01:00".to_string(), "04:00-06:00".into()]).unwrap();
+    fn windows_normalize_and_round_trip() {
+        let r = Windows::try_from(vec!["10:00-01:00".to_string(), "04:00-06:00".into()]).unwrap();
         let back: Vec<String> = r.clone().into();
         // The wrapping window is stored as its two halves, and re-reading that
         // form is a fixed point — so rewriting the file is idempotent.
         assert_eq!(back, ["10:00-24:00", "00:00-01:00", "04:00-06:00"]);
-        assert_eq!(UtcRanges::try_from(back).unwrap(), r);
+        assert_eq!(Windows::try_from(back).unwrap(), r);
     }
 
     #[test]
-    fn utc_ranges_reject_garbage() {
+    fn windows_reject_garbage() {
         for bad in ["10:00", "25:00-26:00", "10:70-11:00", "03:00-03:00", "a-b"] {
             assert!(
-                UtcRanges::try_from(vec![bad.to_string()]).is_err(),
+                Windows::try_from(vec![bad.to_string()]).is_err(),
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn windows_round_trip_weekday_qualifiers() {
+        let r = Windows::try_from(vec![
+            "Mon-Fri 10:00-24:00".to_string(),
+            "Sat-Sun 00:00-24:00".into(),
+            "mon,thu 09:00-17:00".into(),
+        ])
+        .unwrap();
+        let back: Vec<String> = r.clone().into();
+        // Consecutive days collapse to a range; the written form re-reads to
+        // the same windows, so rewriting the file stays idempotent.
+        assert_eq!(
+            back,
+            [
+                "Mon-Fri 10:00-24:00",
+                "Sat-Sun 00:00-24:00",
+                "Mon,Thu 09:00-17:00"
+            ]
+        );
+        assert_eq!(Windows::try_from(back).unwrap(), r);
+    }
+
+    #[test]
+    fn weekday_qualified_window_wrapping_midnight_lands_on_the_next_day() {
+        // "Sun 16:00-01:00" is Sunday evening into Monday — not Sunday
+        // evening plus Sunday's own small hours, which is what splitting a
+        // wrap within one day would have meant.
+        let r = Windows::try_from(vec!["Sun 16:00-01:00".to_string()]).unwrap();
+        let back: Vec<String> = r.clone().into();
+        assert_eq!(back, ["Sun 16:00-24:00", "Mon 00:00-01:00"]);
+        assert_eq!(Windows::try_from(back).unwrap(), r);
+        // 2026-08-23 is a Sunday.
+        assert!(r.contains(at("2026-08-23T20:00:00Z"), Offset::default()));
+        assert!(r.contains(at("2026-08-24T00:30:00Z"), Offset::default()));
+        assert!(!r.contains(at("2026-08-23T00:30:00Z"), Offset::default()));
+    }
+
+    #[test]
+    fn windows_reject_bad_weekdays() {
+        for bad in [
+            "Funday 10:00-11:00",
+            "Mon- 10:00-11:00",
+            "Mon Tue 10:00-11:00",
+        ] {
+            assert!(
+                Windows::try_from(vec![bad.to_string()]).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_offset_shifts_which_instants_a_window_covers() {
+        // The same written schedule, read in two offsets, must select instants
+        // exactly that far apart. This is the whole reason `tz` exists: a
+        // provider states its rule in its own clock, and the table says so
+        // instead of translating it.
+        let spec = vec!["Mon-Fri 09:00-12:00".to_string()];
+        let (utc, east) = (
+            Windows::try_from(spec.clone()).unwrap(),
+            Windows::try_from(spec).unwrap(),
+        );
+        let plus8 = Offset::try_from("+08:00".to_string()).unwrap();
+        // 2026-08-24 is a Monday. 09:00 in +08:00 is 01:00 UTC.
+        assert!(utc.contains(at("2026-08-24T09:00:00Z"), Offset::default()));
+        assert!(!utc.contains(at("2026-08-24T01:00:00Z"), Offset::default()));
+        assert!(east.contains(at("2026-08-24T01:00:00Z"), plus8));
+        assert!(!east.contains(at("2026-08-24T09:00:00Z"), plus8));
+    }
+
+    #[test]
+    fn an_offset_can_carry_a_window_onto_a_different_weekday() {
+        // A weekday named in a non-UTC offset is that offset's weekday, not
+        // UTC's — the case a UTC-only table could only express by shifting the
+        // days by hand.
+        let w = Windows::try_from(vec!["Sat-Sun 00:00-24:00".to_string()]).unwrap();
+        let plus8 = Offset::try_from("+08:00".to_string()).unwrap();
+        // Friday 16:00Z is already Saturday where the schedule is written.
+        let friday_evening = at("2026-08-21T16:00:00Z");
+        assert!(w.contains(friday_evening, plus8));
+        assert!(!w.contains(friday_evening, Offset::default()));
+    }
+
+    #[test]
+    fn offsets_round_trip_and_reject_garbage() {
+        for spec in ["+08:00", "-05:30", "Z"] {
+            let o = Offset::try_from(spec.to_string()).unwrap();
+            assert_eq!(String::from(o), spec, "{spec}");
+        }
+        // UTC has one written form on the way out, whichever was written in.
+        assert_eq!(
+            String::from(Offset::try_from("+00:00".to_string()).unwrap()),
+            "Z"
+        );
+        for bad in ["08:00", "+8", "+25:00", "+19:00", "east", ""] {
+            assert!(Offset::try_from(bad.to_string()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_schedule_written_before_offsets_existed_still_prices_the_same() {
+        // The key was `utc` when windows could only be UTC. Tables in the
+        // field still say that, and must keep pricing identically.
+        let json = r#"{
+            "m": {"input_per_m":1.0,"output_per_m":0.0,"cache_in_input":true,
+                  "off_peak":{"utc":["10:00-12:00"],"multiplier":0.5}}
+        }"#;
+        let t = PriceTable::from_json(json).unwrap();
+        let u = usage(1_000_000, 0, 0, 0);
+        assert_eq!(
+            t.compute(Some("m"), &u, at("2026-08-24T11:00:00Z"))
+                .unwrap(),
+            0.5
+        );
+        assert_eq!(
+            t.compute(Some("m"), &u, at("2026-08-24T13:00:00Z"))
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_weekday_qualified_window_prices_the_same_hour_differently_by_day() {
+        let json = r#"{
+            "m": {"input_per_m":1.0,"output_per_m":0.0,"cache_in_input":true,
+                  "off_peak":{"tz":"+08:00","windows":["Sat-Sun 00:00-24:00"],
+                              "multiplier":0.5}}
+        }"#;
+        let t = PriceTable::from_json(json).unwrap();
+        let u = usage(1_000_000, 0, 0, 0);
+        // 2026-08-26 is a Wednesday, 2026-08-29 a Saturday, both at 02:00 UTC
+        // (10:00 where the schedule is written).
+        assert_eq!(
+            t.compute(Some("m"), &u, at("2026-08-26T02:00:00Z"))
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            t.compute(Some("m"), &u, at("2026-08-29T02:00:00Z"))
+                .unwrap(),
+            0.5
+        );
     }
 
     // ---- pull merges instead of overwriting -------------------------------
@@ -1249,7 +1567,8 @@ mod tests {
         // and a model that disappears upstream keeps its history.
         let mut stored = entry(1.32, 3.96);
         stored.base.off_peak = Some(OffPeak {
-            utc: UtcRanges::try_from(vec!["10:00-01:00".to_string()]).unwrap(),
+            tz: None,
+            windows: Windows::try_from(vec!["10:00-01:00".to_string()]).unwrap(),
             multiplier: 0.5,
         });
         let mut table = one("kept", entry(1.0, 1.0));
