@@ -178,3 +178,129 @@ mod tests {
         );
     }
 }
+
+/// The provider roster is restated by hand on three documented surfaces: the
+/// README's "Works with ..." list, the README's ports table, and the turnpike
+/// skill's frontmatter description — the sentence that decides whether an
+/// agent invokes the skill at all, so a name missing there fails silently.
+/// These tests pin each surface to PROVIDERS so the roster can't change
+/// without the docs moving with it.
+#[cfg(test)]
+mod roster_tests {
+    use super::PROVIDERS;
+    use std::collections::BTreeSet;
+
+    /// Provider id -> the name the docs use in prose. A deliberate hand
+    /// restatement: only a person can decide that `xai` reads as "xAI". The
+    /// panic arm makes a new provider fail here first, forcing both this
+    /// table and the doc surfaces to grow with the registry.
+    fn display_name(id: &str) -> &'static str {
+        match id {
+            "openai" => "OpenAI",
+            "anthropic" => "Anthropic",
+            "gemini" => "Gemini",
+            "deepseek" => "DeepSeek",
+            "openrouter" => "OpenRouter",
+            "kimi" => "Kimi",
+            "minimax" => "MiniMax",
+            "glm" => "GLM",
+            "xai" => "xAI",
+            "groq" => "Groq",
+            other => panic!(
+                "provider {other:?} has no display name; add it here, then to the README list, the ports table, and the skill description"
+            ),
+        }
+    }
+
+    fn repo_file(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn expected_names() -> BTreeSet<String> {
+        PROVIDERS
+            .iter()
+            .map(|p| display_name(p.name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn readme_intro_lists_exactly_the_providers() {
+        let readme = repo_file("README.md");
+        let start = readme
+            .find("Works with")
+            .expect("README lost its 'Works with' provider list");
+        let paragraph = readme[start..].split("\n\n").next().unwrap();
+        // Bold spans are the names: **OpenAI**, **Anthropic**, ...
+        let listed: BTreeSet<String> = paragraph
+            .split("**")
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            listed,
+            expected_names(),
+            "README 'Works with' list is out of sync with PROVIDERS"
+        );
+    }
+
+    #[test]
+    fn readme_ports_table_matches_the_registry() {
+        let readme = repo_file("README.md");
+        let start = readme
+            .find("### Providers and ports")
+            .expect("README lost its 'Providers and ports' section");
+        let section = &readme[start..];
+        let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+
+        let mut listed = BTreeSet::new();
+        for line in section.lines().filter(|l| l.starts_with('|')) {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            if cells.len() != 4 || cells[0] == "Provider" || cells[0].starts_with("---") {
+                continue;
+            }
+            let provider = PROVIDERS
+                .iter()
+                .find(|p| display_name(p.name) == cells[0])
+                .unwrap_or_else(|| {
+                    panic!("ports table row {:?} names no known provider", cells[0])
+                });
+            assert_eq!(
+                cells[1],
+                provider.default_port.to_string(),
+                "{} port drifted from the registry",
+                cells[0]
+            );
+            assert_eq!(
+                cells[3],
+                format!("`{}`", provider.upstream_url),
+                "{} upstream drifted from the registry",
+                cells[0]
+            );
+            listed.insert(cells[0].to_string());
+        }
+        assert_eq!(
+            listed,
+            expected_names(),
+            "ports table rows are out of sync with PROVIDERS"
+        );
+    }
+
+    #[test]
+    fn skill_description_names_every_provider() {
+        let skill = repo_file("skills/turnpike/SKILL.md");
+        let desc = skill
+            .lines()
+            .find(|l| l.starts_with("description:"))
+            .expect("skills/turnpike/SKILL.md lost its frontmatter description");
+        for p in PROVIDERS {
+            let name = display_name(p.name);
+            assert!(
+                desc.contains(name),
+                "skill description never says {name:?}, so the skill will not fire for {} traffic",
+                p.name
+            );
+        }
+    }
+}
