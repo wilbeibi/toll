@@ -56,11 +56,22 @@ qwen/qwen3-coder-480b  1      44021    12134    0           0            -      
 
 ## Install
 
+Every [release](https://github.com/wilbeibi/turnpike/releases) has a binary for
+Linux (x86_64, aarch64) and macOS (Apple silicon, Intel). Unpack one onto your
+`PATH`, or let `cargo binstall` fetch the right one:
+
 ```zsh
-cargo install turnpike
+cargo binstall turnpike        # prebuilt binary
+cargo install turnpike         # or build it yourself, if you have a toolchain
+```
+
+```zsh
 turnpike start                 # start the listeners (runs in the foreground)
 turnpike prices pull           # optional: pull a price table so costs are filled in
 ```
+
+The Linux builds want glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Arch).
+There is no Windows build — the crate doesn't compile there yet.
 
 Or from a clone, to build what's on `main`:
 
@@ -69,9 +80,6 @@ git clone https://github.com/wilbeibi/turnpike
 cd turnpike
 cargo install --path .
 ```
-
-Either way it builds from source, so you need a Rust toolchain; there are no
-prebuilt binaries yet.
 
 ### Keeping it running
 
@@ -91,6 +99,9 @@ WantedBy=default.target
 ```zsh
 systemctl --user enable --now turnpike
 ```
+
+`ExecStart` has to be the binary's real path — `~/.cargo/bin` if you installed
+with cargo, wherever you unpacked it if you took a release tarball.
 
 On macOS, a launchd agent or any process manager works the same way; a terminal
 tab or `tmux` window is fine while you're trying it out.

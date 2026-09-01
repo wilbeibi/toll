@@ -1,0 +1,61 @@
+name: Release
+
+# Pushing a `vX.Y.Z` tag cuts a GitHub release and attaches a binary per
+# platform, so trying turnpike doesn't start with a rustc run — rusqlite is
+# bundled and ring needs a C compiler, which is a couple of minutes and a
+# toolchain before the first metered call.
+#
+# Every runner is native to the target it builds, so there is no cross setup to
+# go wrong. Linux is built on 22.04 because a binary runs on the glibc it was
+# built against or newer, and 2.35 covers Ubuntu 22.04+, Debian 12+, Fedora 36+
+# and Arch. Windows is absent: the crate doesn't build there — the SIGTERM
+# handler in proxy.rs and the $HOME data dir in paths.rs are unix-only.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags: ["v[0-9]+.*"]
+
+jobs:
+  create-release:
+    name: create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # Also asserts the tag matches the version in Cargo.toml, so a mistyped
+      # tag fails here rather than shipping assets nothing can resolve.
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    name: ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: turnpike
+          target: ${{ matrix.target }}
+          # `$bin-$tag-$target` is one of the layouts cargo-binstall resolves by
+          # default, and what [package.metadata.binstall] points at.
+          archive: $bin-$tag-$target
+          include: README.md,LICENSE
+          checksum: sha256
+          locked: true
+          token: ${{ secrets.GITHUB_TOKEN }}
