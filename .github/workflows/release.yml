@@ -25,7 +25,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Also asserts the tag matches the version in Cargo.toml, so a mistyped
       # tag fails here rather than shipping assets nothing can resolve.
       - uses: taiki-e/create-gh-release-action@v1
@@ -47,7 +47,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: turnpike
