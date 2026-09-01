@@ -10,6 +10,13 @@ readme = "README.md"
 keywords = ["llm", "proxy", "metering", "cost", "openai"]
 categories = ["command-line-utilities", "development-tools"]
 
+# Where `cargo binstall turnpike` looks for the tarballs .github/workflows/
+# release.yml uploads. The archive holds the bare binary, not a leading dir.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [[bin]]
 name = "turnpike"
 path = "src/main.rs"
